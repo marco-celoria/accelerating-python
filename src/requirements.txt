@@ -1,0 +1,11 @@
+cutensor-cu12==2.3.0
+cupy-cuda12x==14.1.1
+nvtx==0.2.12
+numba==0.65.1
+llvmlite==0.47.0
+numpy==2.4.6
+scipy==1.17.0
+matplotlib==3.10.9
+mpi4py==4.1.2
+jupyterlab==4.5.8
+ipykernel==7.3.0
