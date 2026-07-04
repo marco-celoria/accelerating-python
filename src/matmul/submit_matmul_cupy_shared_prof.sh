@@ -30,7 +30,7 @@ cd -
 
 mkdir -p reports_cupy_shared_${SLURM_JOB_ID}
 
-nsys profile --trace=cuda,cublas  -o nsys_prof_matmul_cupy_shared.%p python matmul_cupy_shared.py 10000 10000 10000 10
+nsys profile --trace=cuda,cublas,nvtx,osrt  -o nsys_prof_matmul_cupy_shared.%p python matmul_cupy_shared.py 10000 10000 10000 10
 
 ncu --set full --section  SpeedOfLight_HierarchicalTensorRooflineChart  -o ncu_prof_matmul_cupy_shared.%p python matmul_cupy_shared.py 10000 10000 10000 1
 
