@@ -42,6 +42,7 @@ def main():
     print(f"interior rel L2   : {interior_rel_l2:.16e}")
     if not np.allclose(ua, ub, rtol=args.rtol, atol=args.atol):
         print("FAILED")
+        raise SystemExit(1)
     print("PASSED")
 
 

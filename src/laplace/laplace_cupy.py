@@ -3,6 +3,27 @@
 import argparse
 import cupy as cp
 import numpy as np
+from contextlib import contextmanager
+
+
+@contextmanager
+def nvtx_range(name: str, id_color: int = -1):
+    pushed = False
+    try:
+        cp.cuda.nvtx.RangePush(name, id_color)
+        pushed = True
+    except Exception:
+        pushed = False
+
+    try:
+        yield
+    finally:
+        if pushed:
+            try:
+                cp.cuda.nvtx.RangePop()
+            except Exception:
+                pass
+
 
 class Laplace2DCuPy:
     """
@@ -87,19 +108,27 @@ class Laplace2DCuPy:
     # Boundary conditions
     def _apply_dirichlet_bc(self, arr):
         # same order as NumPy + distributed solver
-        cp.cuda.nvtx.RangePush("_apply_dirichlet_bc")
-        try:
+        with nvtx_range("_apply_dirichlet_bc"):
             arr[ :,  0] = self.bc_left
             arr[ :, -1] = self.bc_right
             arr[ 0,  :] = self.bc_bottom
             arr[-1,  :] = self.bc_top
-        finally:
-            cp.cuda.nvtx.RangePop()
+
+
+    def reset_fields(self):
+        """
+        Reset solution arrays to the initial condition.
+        This is useful after warm-up so the timed run starts from the same state.
+        """
+        self.u.fill(0.0)
+        self.unew.fill(0.0)
+        self._apply_dirichlet_bc(self.u)
+        self._apply_dirichlet_bc(self.unew)
+        cp.cuda.get_current_stream().synchronize()
 
     # Compute kernel (vectorized)
     def jacobi_step(self):
-        cp.cuda.nvtx.RangePush("jacobi_step")
-        try:
+        with nvtx_range("jacobi_step"):
             # Vectorized CuPy is productive and readable, 
             # but for stencil kernels it may generate multiple memory passes. 
             # A custom kernel can reduce temporaries and improve memory bandwidth use.
@@ -111,31 +140,38 @@ class Laplace2DCuPy:
             # the boundary entries of unew remain unchanged after initialization.
             # Since jacobi_step writes only interior points, boundaries remain valid across ping-pong swaps.
             #self._apply_dirichlet_bc(self.unew) <- Not needed because only interior points are overwritten.
-        finally:
-            cp.cuda.nvtx.RangePop()
 
     # Relative update norm
     def compute_relative_l2_update_norm(self):
-        cp.cuda.nvtx.RangePush("compute_relative_l2_update_norm")
         rel_update_norm = 0.0
-        try:
+        with nvtx_range("compute_relative_l2_update_norm"): 
             diff = self.unew[1:-1, 1:-1] - self.u[1:-1, 1:-1]
             interior = self.unew[1:-1, 1:-1]
             diff2 = cp.sum(diff * diff)
             norm2 = cp.sum(interior * interior)
             rel_update_norm_gpu = cp.sqrt(diff2) / cp.maximum(cp.sqrt(norm2), 1.0e-300)
             rel_update_norm = rel_update_norm_gpu.get()
-        finally:
-            cp.cuda.nvtx.RangePop()
         return float(rel_update_norm)
+
+
+    def warmup(self):
+        """
+        Warm up CuPy kernels/reductions before timed run.
+        Resets fields afterwards so the benchmark starts from the initial condition.
+        """
+        with nvtx_range("warmup"):
+            self.jacobi_step()
+            _ = self.compute_relative_l2_update_norm()
+            cp.cuda.get_current_stream().synchronize()
+        self.reset_fields()
+
 
     # Solver loop
     def run(self, max_iters, tol, check_every, fixed_iters=None):
-        cp.cuda.nvtx.RangePush("run")
         rel_update_norm = float("inf")
         niters = 0
         elapsed = 0.0
-        try:
+        with nvtx_range("run"):
             Laplace2DCuPy._validate_run_parameters(max_iters, tol, check_every, fixed_iters)
             nstop = fixed_iters if fixed_iters is not None else max_iters
             start = cp.cuda.Event()
@@ -158,14 +194,11 @@ class Laplace2DCuPy:
             stop.record()
             stop.synchronize()
             elapsed = cp.cuda.get_elapsed_time(start, stop) / 1000.0
-        finally:
-            cp.cuda.nvtx.RangePop()
         return niters, rel_update_norm, elapsed
 
     # Output
     def write_hdf5(self, filename, niters, rel_update_norm):
-        cp.cuda.nvtx.RangePush("write_hdf5")
-        try:
+        with nvtx_range("write_hdf5"):
             import h5py
             cp.cuda.get_current_stream().synchronize()
             with h5py.File(filename, "w") as f:
@@ -185,8 +218,6 @@ class Laplace2DCuPy:
                 dset.attrs["dx"] = self.dx
                 dset.attrs["dy"] = self.dy
                 dset.attrs["dtype"] = str(self.u.dtype)
-        finally:
-            cp.cuda.nvtx.RangePop()
 
 
 # CLI
@@ -275,6 +306,11 @@ def main():
         bc_bottom=args.bc_bottom,
         bc_top=args.bc_top,
     )
+
+    print("Warming up...", flush=True)
+    solver.warmup()
+    print("Warm-up complete.", flush=True)
+
     niters, rel_update_norm, elapsed = solver.run(
         max_iters=args.max_iters,
         tol=args.tol,

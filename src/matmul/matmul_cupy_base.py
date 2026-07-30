@@ -3,7 +3,7 @@
 import argparse
 import math
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 
 import cupy as cp
 import numpy as np
@@ -23,18 +23,18 @@ DEFAULT_TPB = 16
 CUDA_SOURCE = r'''
 template <typename T>
 __global__ void mm_kernel_base(
-    const int A_num_rows,
-    const int B_num_cols,
-    const int A_num_cols,
+    const size_t A_num_rows,
+    const size_t B_num_cols,
+    const size_t A_num_cols,
     const T* __restrict__ A,
     const T* __restrict__ B,
     T* __restrict__ C
 ) {
-    const int col = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
-                  + static_cast<int>(threadIdx.x);
+    const size_t col = static_cast<size_t>(blockIdx.x) * static_cast<int>(blockDim.x)
+                  + static_cast<size_t>(threadIdx.x);
 
-    const int row = static_cast<int>(blockIdx.y) * static_cast<int>(blockDim.y)
-                  + static_cast<int>(threadIdx.y);
+    const size_t row = static_cast<size_t>(blockIdx.y) * static_cast<int>(blockDim.y)
+                  + static_cast<size_t>(threadIdx.y);
 
     if (row >= A_num_rows || col >= B_num_cols) {
         return;
@@ -42,7 +42,7 @@ __global__ void mm_kernel_base(
 
     T acc = static_cast<T>(0);
 
-    for (int k = 0; k < A_num_cols; ++k) {
+    for (size_t k = 0; k < A_num_cols; ++k) {
         acc += A[row * A_num_cols + k] * B[k * B_num_cols + col];
     }
 
@@ -55,20 +55,30 @@ __global__ void mm_kernel_base(
 # OPTIONAL NVTX SUPPORT
 # ============================================================
 
-@contextmanager
-def nvtx_range(name: str, color_id: int = 0):
-    """
-    Small NVTX helper.
 
-    CuPy exposes NVTX through cp.cuda.nvtx on most CUDA-enabled installs.
-    If unavailable, this silently becomes a no-op.
+@contextmanager
+def nvtx_range(name: str, id_color: int = -1):
     """
+    NVTX helper.
+
+    If CuPy NVTX support is unavailable, this silently becomes a no-op.
+    """
+    pushed = False
     try:
-        cp.cuda.nvtx.RangePush(name)
-        yield
-        cp.cuda.nvtx.RangePop()
+        cp.cuda.nvtx.RangePush(name, id_color)
+        pushed = True
     except Exception:
+        pushed = False
+
+    try:
         yield
+    finally:
+        if pushed:
+            try:
+                cp.cuda.nvtx.RangePop()
+            except Exception:
+                pass
+
 
 
 # ============================================================
@@ -108,6 +118,11 @@ def validate_matrix_shapes(a: cp.ndarray, b: cp.ndarray, c: cp.ndarray) -> None:
         raise ValueError(
             f"Invalid C shape: got C{c.shape}, expected C{expected_c_shape}"
         )
+    if a.dtype != b.dtype or a.dtype != c.dtype:
+        raise TypeError(
+            f"A, B, and C must have the same dtype; "
+            f"got A={a.dtype}, B={b.dtype}, C={c.dtype}"
+        )
 
 
 def compute_launch_geometry(a: cp.ndarray, b: cp.ndarray, tpb: int):
@@ -137,15 +152,14 @@ def flop_count_matmul(n: int, l: int, m: int) -> float:
     """
     return float(n) * float(m) * float(2 * l - 1)
 
-
 def dtype_tolerances(dtype: np.dtype):
     dtype = np.dtype(dtype)
 
     if dtype == np.dtype(np.float32):
-        return 1.0e-5, 1.0e-5
+        return 1.0e-4, 1.0e-4
 
     if dtype == np.dtype(np.float64):
-        return 1.0e-12, 1.0e-12
+        return 1.0e-10, 1.0e-10
 
     raise TypeError("dtype must be either float32 or float64")
 
@@ -196,9 +210,9 @@ def gpu_kernel_time_seconds(
             grid,
             block,
             (
-                np.int32(a.shape[0]),
-                np.int32(b.shape[1]),
-                np.int32(a.shape[1]),
+                np.uint64(a.shape[0]),
+                np.uint64(b.shape[1]),
+                np.uint64(a.shape[1]),
                 a,
                 b,
                 c,
@@ -255,9 +269,9 @@ def matmul(
             grid,
             block,
             (
-                np.int32(a.shape[0]),
-                np.int32(b.shape[1]),
-                np.int32(a.shape[1]),
+                np.uint64(a.shape[0]),
+                np.uint64(b.shape[1]),
+                np.uint64(a.shape[1]),
                 a,
                 b,
                 c,

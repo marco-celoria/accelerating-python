@@ -42,13 +42,32 @@ NSYS_COMMON="nsys profile \
   --cpuctxsw=none \
   --cuda-memory-usage=true"
 
+${NSYS_COMMON} \
+  --trace=cuda,nvtx,osrt \
+  -o profiles_${SLURM_JOB_ID}/prof_laplace_cupy.job${SLURM_JOB_ID} \
+  python laplace_cupy.py \
+  --nx 40000 \
+  --ny 40000 \
+  --fixed-iters 100 \
+  --output outputs_${SLURM_JOB_ID}/out_laplace_cupy_100.h5
+
+${NSYS_COMMON} \
+  --trace=cuda,nvtx,osrt \
+  -o profiles_${SLURM_JOB_ID}/prof_laplace_cupy_raw.job${SLURM_JOB_ID} \
+  python laplace_cupy_raw.py \
+  --nx 40000 \
+  --ny 40000 \
+  --fixed-iters 100 \
+  --tol -1.0 \
+  --output outputs_${SLURM_JOB_ID}/out_laplace_cupy_raw_100.h5
+
 srun ${NSYS_COMMON} \
   --trace=cuda,nvtx,osrt,mpi,ucx \
   --mpi-impl=openmpi \
   -o profiles_${SLURM_JOB_ID}/prof_laplace_cupy_nccl.rank%q{SLURM_PROCID}.job${SLURM_JOB_ID} \
   python laplace_cupy_nccl.py \
-  --nx 32768 \
-  --ny 32768 \
+  --nx 40000 \
+  --ny 40000 \
   --fixed-iters 100 \
   --tol -1.0 \
   --output outputs_${SLURM_JOB_ID}/out_laplace_cupy_nccl_100.h5
@@ -56,57 +75,38 @@ srun ${NSYS_COMMON} \
 srun ${NSYS_COMMON} \
   --trace=cuda,nvtx,osrt,mpi,ucx \
   --mpi-impl=openmpi \
-  -o profiles_${SLURM_JOB_ID}/prof_laplace_numba_mpi.rank%q{SLURM_PROCID}.job${SLURM_JOB_ID} \
-  python laplace_numba_mpi.py \
-  --nx 32768 \
-  --ny 32768 \
-  --fixed-iters 100 \
-  --tol -1.0 \
-  --output outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100.h5
-
-srun ${NSYS_COMMON} \
-  --trace=cuda,nvtx,osrt,mpi,ucx \
-  --mpi-impl=openmpi \
   -o profiles_${SLURM_JOB_ID}/prof_laplace_cupy_mpi.rank%q{SLURM_PROCID}.job${SLURM_JOB_ID} \
   python laplace_cupy_mpi.py \
-  --nx 32768 \
-  --ny 32768 \
+  --nx 40000 \
+  --ny 40000 \
   --fixed-iters 100 \
   --tol -1.0 \
   --output outputs_${SLURM_JOB_ID}/out_laplace_cupy_mpi_100.h5
 
 ${NSYS_COMMON} \
   --trace=cuda,nvtx,osrt \
-  -o profiles_${SLURM_JOB_ID}/prof_laplace_cupy.job${SLURM_JOB_ID} \
-  python laplace_cupy.py \
-  --nx 32768 \
-  --ny 32768 \
-  --fixed-iters 100 \
-  --output outputs_${SLURM_JOB_ID}/out_laplace_cupy_100.h5
-
-${NSYS_COMMON} \
-  --trace=cuda,nvtx,osrt \
-  -o profiles_${SLURM_JOB_ID}/prof_laplace_rawcupy.job${SLURM_JOB_ID} \
-  python laplace_rawcupy.py \
-  --nx 32768 \
-  --ny 32768 \
-  --fixed-iters 100 \
-  --tol -1.0 \
-  --output outputs_${SLURM_JOB_ID}/out_laplace_rawcupy_100.h5
-
-${NSYS_COMMON} \
-  --trace=cuda,nvtx,osrt \
   -o profiles_${SLURM_JOB_ID}/prof_laplace_numba.job${SLURM_JOB_ID} \
   python laplace_numba.py \
-  --nx 32768 \
-  --ny 32768 \
+  --nx 40000 \
+  --ny 40000 \
   --fixed-iters 100 \
   --tol -1.0 \
   --output outputs_${SLURM_JOB_ID}/out_laplace_numba_100.h5
 
+srun ${NSYS_COMMON} \
+  --trace=cuda,nvtx,osrt,mpi,ucx \
+  --mpi-impl=openmpi \
+  -o profiles_${SLURM_JOB_ID}/prof_laplace_numba_mpi.rank%q{SLURM_PROCID}.job${SLURM_JOB_ID} \
+  python laplace_numba_mpi.py \
+  --nx 40000 \
+  --ny 40000 \
+  --fixed-iters 100 \
+  --tol -1.0 \
+  --output outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100.h5
+
 python laplace_numpy.py \
-  --nx 32768 \
-  --ny 32768 \
+  --nx 40000 \
+  --ny 40000 \
   --fixed-iters 100 \
   --tol -1.0 \
   --output outputs_${SLURM_JOB_ID}/out_laplace_numpy_100.h5
@@ -120,7 +120,7 @@ python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_numpy_100.h5 outputs_${
 echo "Numpy vs Cupy"
 python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_numpy_100.h5 outputs_${SLURM_JOB_ID}/out_laplace_cupy_100.h5
 echo "Numpy vs Raw Cupy"
-python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_numpy_100.h5 outputs_${SLURM_JOB_ID}/out_laplace_rawcupy_100.h5
+python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_numpy_100.h5 outputs_${SLURM_JOB_ID}/out_laplace_cupy_raw_100.h5
 echo "Numpy vs Numba Cuda"
 python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_numpy_100.h5 outputs_${SLURM_JOB_ID}/out_laplace_numba_100.h5
 

@@ -2,13 +2,33 @@
 import argparse
 import numpy as np
 from numba import cuda
-import nvtx
+from contextlib import contextmanager
+import cupy as cp
+
+
+@contextmanager
+def nvtx_range(name: str, id_color: int = -1):
+    pushed = False
+    try:
+        cp.cuda.nvtx.RangePush(name, id_color)
+        pushed = True
+    except Exception:
+        pushed = False
+
+    try:
+        yield
+    finally:
+        if pushed:
+            try:
+                cp.cuda.nvtx.RangePop()
+            except Exception:
+                pass
+
 
 
 TPB_X = 32
 TPB_Y = 8
 REDUCE_TPB = 256
-
 
 @cuda.reduce
 def sum_reduce(a, b):
@@ -154,14 +174,25 @@ class Laplace2DNumbaCUDA:
           1. left/right
           2. bottom/top
         """
-        rng_bc = nvtx.start_range(message="_apply_dirichlet_bc_host", color="blue")
-        try:
+        with nvtx_range("_apply_dirichlet_bc_host", id_color=1):
             arr[:,  0] = self.bc_left
             arr[:, -1] = self.bc_right
             arr[ 0, :] = self.bc_bottom
             arr[-1, :] = self.bc_top
-        finally:
-            nvtx.end_range(rng_bc)
+
+
+    def reset_fields(self):
+        """
+        Reset device solution arrays to the initial condition.
+        """
+        h_u = np.zeros((self.ny, self.nx), dtype=np.float64)
+        h_unew = np.zeros_like(h_u)
+        self._apply_dirichlet_bc_host(h_u)
+        self._apply_dirichlet_bc_host(h_unew)
+        self.d_u.copy_to_device(h_u)
+        self.d_unew.copy_to_device(h_unew)
+        cuda.synchronize()
+
 
     # Compute kernel
     def jacobi_step(self):
@@ -172,15 +203,12 @@ class Laplace2DNumbaCUDA:
         Boundary values are initialized once in both arrays and are not
         overwritten because the kernel updates only interior points.
         """
-        rng_step = nvtx.start_range(message="jacobi_step", color="orange")
-        try:
+        with nvtx_range("jacobi_step", id_color=2):
             threads = (TPB_X, TPB_Y)
             blocks = ((self.nx - 2 + threads[0] - 1) // threads[0], (self.ny - 2 + threads[1] - 1) // threads[1],)
             jacobi_kernel[blocks, threads](
                 self.d_u, self.d_unew, self.nx, self.ny, self.dx2, self.dy2, self.inv_denom,
             )
-        finally:
-            nvtx.end_range(rng_step)
 
     # Relative update norm
     def compute_relative_l2_update_norm(self):
@@ -189,9 +217,8 @@ class Laplace2DNumbaCUDA:
             ||u_new - u||_2 / ||u_new||_2
         over true global interior points only.
         """
-        rng_l2 = nvtx.start_range(message="jacobi_l2", color="green")
         rel_update_norm = 0.0
-        try:
+        with nvtx_range("jacobi_l2", id_color=3):
             n = (self.ny - 2) * (self.nx - 2)
             blocks = (n + REDUCE_TPB - 1) // REDUCE_TPB
             rel_update_norm_map_kernel[blocks, REDUCE_TPB](
@@ -205,17 +232,26 @@ class Laplace2DNumbaCUDA:
             diff2 = sum_reduce(self.d_diff_sq, size=n)
             norm2 = sum_reduce(self.d_norm_sq, size=n)
             rel_update_norm = np.sqrt(diff2) / max(np.sqrt(norm2), 1.0e-300)
-        finally:
-            nvtx.end_range(rng_l2)
         return float(rel_update_norm) 
+
+
+    def warmup(self):
+        """
+        Warm up Numba CUDA kernels and reductions.
+        This forces JIT compilation before timing.
+        """
+        with nvtx_range("warmup", id_color=4):
+            self.jacobi_step()
+            _ = self.compute_relative_l2_update_norm()
+            cuda.synchronize()
+        self.reset_fields()
 
     # Solver loop
     def run(self, max_iters, tol, check_every, fixed_iters=None):
-        rng_run = nvtx.start_range(message="jacobi_run", color="yellow")
         rel_update_norm = float("inf")
         niters = 0
         elapsed = 0.0
-        try:
+        with nvtx_range("jacobi_run", id_color=5):
             Laplace2DNumbaCUDA._validate_run_parameters(max_iters, tol, check_every, fixed_iters)
             nstop = fixed_iters if fixed_iters is not None else max_iters
             start = cuda.event()
@@ -236,8 +272,6 @@ class Laplace2DNumbaCUDA:
             stop.record()
             stop.synchronize()
             elapsed = cuda.event_elapsed_time(start, stop) / 1000.0
-        finally:
-            nvtx.end_range(rng_run)
         return niters, rel_update_norm, elapsed
 
     # Output
@@ -246,8 +280,7 @@ class Laplace2DNumbaCUDA:
         Write Numba CUDA solution to HDF5.
         The solution is copied explicitly from GPU to host before writing.
         """
-        rng_write = nvtx.start_range(message="jacobi_write", color="red")
-        try:
+        with nvtx_range("jacobi_write", id_color=6):
             import h5py
             cuda.synchronize()
             host_u = self.d_u.copy_to_host()
@@ -268,8 +301,6 @@ class Laplace2DNumbaCUDA:
                 dset.attrs["niters"] = niters
                 dset.attrs["rel_update_norm"] = float(rel_update_norm)
                 dset.attrs["dtype"] = str(host_u.dtype)
-        finally:
-            nvtx.end_range(rng_write)
 
 # CLI
 def parse_args():
@@ -363,6 +394,11 @@ def main():
         bc_bottom=args.bc_bottom,
         bc_top=args.bc_top,
     )
+
+    print("Warming up Numba CUDA kernels...", flush=True)
+    solver.warmup()
+    print("Warm-up complete.", flush=True)
+
     niters, rel_update_norm, elapsed = solver.run(
         max_iters=args.max_iters,
         tol=args.tol,

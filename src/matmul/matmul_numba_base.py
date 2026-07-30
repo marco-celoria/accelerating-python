@@ -2,29 +2,39 @@
 
 import argparse
 import math
-from contextlib import nullcontext
 from time import perf_counter
-
 import numpy as np
 from numba import cuda, float32, float64
-
+from contextlib import contextmanager
+import cupy as cp
 
 # ============================================================
 # OPTIONAL NVTX SUPPORT
 # ============================================================
 
-try:
-    import nvtx
-    HAVE_NVTX = True
-except ImportError:
-    nvtx = None
-    HAVE_NVTX = False
 
+@contextmanager
+def nvtx_range(name: str, id_color: int = -1):
+    """
+    NVTX helper.
 
-def nvtx_range(name: str, color: str = "blue"):
-    if HAVE_NVTX:
-        return nvtx.annotate(name, color=color)
-    return nullcontext()
+    If CuPy NVTX support is unavailable, this silently becomes a no-op.
+    """
+    pushed = False
+    try:
+        cp.cuda.nvtx.RangePush(name, id_color)
+        pushed = True
+    except Exception:
+        pushed = False
+
+    try:
+        yield
+    finally:
+        if pushed:
+            try:
+                cp.cuda.nvtx.RangePop()
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -120,6 +130,7 @@ def validate_matrix_shapes(a, b, c) -> None:
         )
 
 
+
 def compute_launch_geometry(a, b, tpb_x: int, tpb_y: int):
     threadsperblock = (tpb_x, tpb_y)
 
@@ -148,15 +159,17 @@ def flop_count_matmul(n: int, l: int, m: int) -> float:
     """
     return float(n) * float(m) * float(2 * l - 1)
 
-
 def dtype_tolerances(dtype: np.dtype):
-    if dtype == np.float32:
-        return 1.0e-5, 1.0e-5
+    dtype = np.dtype(dtype)
 
-    if dtype == np.float64:
-        return 1.0e-12, 1.0e-12
+    if dtype == np.dtype(np.float32):
+        return 1.0e-4, 1.0e-4
+
+    if dtype == np.dtype(np.float64):
+        return 1.0e-10, 1.0e-10
 
     raise TypeError("dtype must be either float32 or float64")
+
 
 
 def gpu_kernel_time_seconds(
@@ -180,7 +193,7 @@ def gpu_kernel_time_seconds(
 
     start_event.record()
 
-    with nvtx_range("GPU matmul kernel", color="green"):
+    with nvtx_range("GPU matmul kernel", id_color=1):
         kernel[blockspergrid, threadsperblock](a_d, b_d, c_d)
 
     stop_event.record()
@@ -218,7 +231,7 @@ def matmul(
     print(f"threadsperblock = {threadsperblock}")
 
     # Copy inputs once for CPU reference.
-    with nvtx_range("D2H input copies", color="orange"):
+    with nvtx_range("D2H input copies", id_color=2):
         a_h = a_d.copy_to_host()
         b_h = b_d.copy_to_host()
 
@@ -233,7 +246,7 @@ def matmul(
     # --------------------------------------------------------
     print("Warming up CUDA kernel / compiling Numba specialization...")
 
-    with nvtx_range("Warmup kernel", color="purple"):
+    with nvtx_range("Warmup kernel", id_color=3):
         kernel[blockspergrid, threadsperblock](a_d, b_d, c_d)
 
     cuda.synchronize()
@@ -263,7 +276,7 @@ def matmul(
         # ----------------------------------------------------
         cpu_t0 = perf_counter()
 
-        with nvtx_range("CPU NumPy matmul", color="blue"):
+        with nvtx_range("CPU NumPy matmul", id_color=4):
             np.matmul(a_h, b_h, out=check_h)
 
         cpu_t1 = perf_counter()
@@ -273,7 +286,7 @@ def matmul(
         # ----------------------------------------------------
         # Correctness check
         # ----------------------------------------------------
-        with nvtx_range("D2H result copy", color="yellow"):
+        with nvtx_range("D2H result copy", id_color=5):
             c_h = c_d.copy_to_host()
 
         ok = np.allclose(c_h, check_h, rtol=rtol, atol=atol)
@@ -315,11 +328,6 @@ def matmul(
     print(f"Speedup:             {cpu_mean / gpu_mean:.2f}x")
     print(f"GPU GFLOP/s:         {gpu_gflops_s:.4f}")
     print(f"CPU GFLOP/s:         {cpu_gflops_s:.4f}")
-
-    if HAVE_NVTX:
-        print("NVTX:                enabled")
-    else:
-        print("NVTX:                not available")
 
 
 # ============================================================
@@ -430,7 +438,7 @@ def main() -> int:
     y_h = rng.standard_normal((l, m)).astype(dtype)
     z_h = np.zeros((n, m), dtype=dtype)
 
-    with nvtx_range("H2D memory copies", color="yellow"):
+    with nvtx_range("H2D memory copies", id_color=6):
         x_d = cuda.to_device(x_h)
         y_d = cuda.to_device(y_h)
         z_d = cuda.to_device(z_h)

@@ -82,6 +82,7 @@ class Laplace2DNumPy:
                 raise ValueError("tol must be finite and positive unless fixed_iters is used")
 
 
+
     # Boundary conditions
     def _apply_dirichlet_bc(self, arr):
         # match ordering of distributed version
@@ -89,6 +90,18 @@ class Laplace2DNumPy:
         arr[ :, -1] = self.bc_right
         arr[ 0,  :] = self.bc_bottom
         arr[-1,  :] = self.bc_top
+    
+    
+    def reset_fields(self):
+        """
+        Reset solution arrays to the initial condition.
+        This is useful after warm-up so the timed run starts from the same state.
+        """
+        self.u.fill(0.0)
+        self.unew.fill(0.0)
+        self._apply_dirichlet_bc(self.u)
+        self._apply_dirichlet_bc(self.unew)
+
 
     # Compute kernel
     def jacobi_step(self):
@@ -242,7 +255,7 @@ def main():
     )
     print(f"iterations                : {niters}")
     print(f"final relative update norm: {rel_update_norm:.6e}")
-    print(f"NumPy elapsed time[s]     : {elapsed:.6f} s")
+    print(f"NumPy elapsed time[s]     : {elapsed:.6f}")
     print(f"NumPy time per iter [ms]  : {1000.0 * elapsed / max(niters, 1):.6f}")
     if args.output is not None:
         solver.write_hdf5(args.output, niters, rel_update_norm)

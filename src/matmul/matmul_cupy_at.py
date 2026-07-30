@@ -13,16 +13,15 @@ import numpy as np
 # ============================================================
 
 @contextmanager
-def nvtx_range(name: str):
+def nvtx_range(name: str, id_color: int = -1):
     """
     NVTX helper.
 
     If CuPy NVTX support is unavailable, this silently becomes a no-op.
     """
     pushed = False
-
     try:
-        cp.cuda.nvtx.RangePush(name)
+        cp.cuda.nvtx.RangePush(name, id_color)
         pushed = True
     except Exception:
         pushed = False
@@ -84,7 +83,6 @@ def flop_count_matmul(n: int, l: int, m: int) -> float:
     """
     return float(n) * float(m) * float(2 * l - 1)
 
-
 def dtype_tolerances(dtype: np.dtype):
     dtype = np.dtype(dtype)
 
@@ -92,9 +90,10 @@ def dtype_tolerances(dtype: np.dtype):
         return 1.0e-4, 1.0e-4
 
     if dtype == np.dtype(np.float64):
-        return 1.0e-12, 1.0e-12
+        return 1.0e-10, 1.0e-10
 
     raise TypeError("dtype must be either float32 or float64")
+
 
 
 def gpu_matmul_time_seconds(

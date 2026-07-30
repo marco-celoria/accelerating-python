@@ -6,7 +6,7 @@ mpi4py.rc.thread_level = "funneled"
 from mpi4py import MPI
 import numpy as np
 import cupy as cp
-
+from contextlib import contextmanager
 # This example requires CUDA-aware MPI.
 # If the MPI library is not CUDA-aware,
 # passing CuPy arrays directly to Sendrecv/Allreduce
@@ -14,6 +14,25 @@ import cupy as cp
 
 # RawKernel assumes contiguous row-major arrays.
 # Do not pass transposed or strided views unless the kernel explicitly handles strides.
+
+@contextmanager
+def nvtx_range(name: str, id_color: int = -1):
+    pushed = False
+    try:
+        cp.cuda.nvtx.RangePush(name, id_color)
+        pushed = True
+    except Exception:
+        pushed = False
+
+    try:
+        yield
+    finally:
+        if pushed:
+            try:
+                cp.cuda.nvtx.RangePop()
+            except Exception:
+                pass
+
 
 jacobi_kernel = cp.RawKernel(r'''
 extern "C" __global__
@@ -269,32 +288,26 @@ class Laplace2DDistributedCUDAAwareMPI:
           - global bottom boundary
           - global top boundary
         """
-        cp.cuda.nvtx.RangePush("_owned_update_row_bounds")
         first = 1
         last_exclusive = self.local_ny + 1
-        try:
+        with nvtx_range("_owned_update_row_bounds"):
             if self.ystart == 0:
                 first = 2
             if self.yend == self.ny:
                 last_exclusive = self.local_ny
-        finally:
-            cp.cuda.nvtx.RangePop()
         return first, last_exclusive
 
     def _apply_dirichlet_bc(self, arr):
         """
         Apply physical Dirichlet boundary conditions.
         """
-        cp.cuda.nvtx.RangePush("_apply_dirichlet_bc")
-        try:
+        with nvtx_range("_apply_dirichlet_bc"):
             arr[1 : self.local_ny + 1, 0] = self.bc_left
             arr[1 : self.local_ny + 1, self.nx - 1] = self.bc_right
             if self.rank == 0:
                 arr[1, :] = self.bc_bottom
             if self.rank == self.size - 1:
                 arr[self.local_ny, :] = self.bc_top
-        finally:
-            cp.cuda.nvtx.RangePop()
 
     def exchange_halos_mpi(self):
         """
@@ -303,8 +316,7 @@ class Laplace2DDistributedCUDAAwareMPI:
           - 100: upward send, rank r sends row 1 to rank r-1
           - 200: downward send, rank r sends row local_ny to rank r+1
         """
-        cp.cuda.nvtx.RangePush("exchange_halos_mpi")
-        try:
+        with nvtx_range("exchange_halos_mpi"):
             stream = cp.cuda.get_current_stream()
             # Required for portable CUDA-aware MPI behavior:
             # make sure previous GPU writes to self.u are visible to MPI.
@@ -331,15 +343,12 @@ class Laplace2DDistributedCUDAAwareMPI:
                 source=self.down,
                 recvtag=100,
             )
-        finally:
-            cp.cuda.nvtx.RangePop()
 
     def jacobi_step(self):
         """
         One RawKernel Jacobi update.
         """
-        cp.cuda.nvtx.RangePush("jacobi_step")
-        try:
+        with nvtx_range("jacobi_step"):
             i0, i1 = self._owned_update_row_bounds()
             if i0 >= i1:
                 return
@@ -347,14 +356,16 @@ class Laplace2DDistributedCUDAAwareMPI:
             blocks = ((self.nx - 2 + threads[0] - 1) // threads[0], (i1 - i0 + threads[1] - 1) // threads[1],)
             jacobi_kernel(blocks, threads,
                 (self.u, self.unew, np.uint64(self.nx), np.uint64(i0), np.uint64(i1), self.dx2, self.dy2, self.inv_denom,),)
-        finally:
-            cp.cuda.nvtx.RangePop()
 
 
     def compute_local_reduction_rawkernel(self, i0, i1):
         n = max(0, (i1 - i0) * (self.nx - 2))
-        shared_mem_bytes = (2 * self.rel_update_norm_threads * cp.dtype(cp.float64).itemsize)
-        rel_update_norm_partial_kernel((self.rel_update_norm_blocks,), (self.rel_update_norm_threads,),
+        if n == 0:
+            return cp.asarray(0.0, dtype=cp.float64), cp.asarray(0.0, dtype=cp.float64)
+        threads = self.rel_update_norm_threads
+        blocks = min(4096, (n + threads - 1) // threads)
+        shared_mem_bytes = 2 * threads * cp.dtype(cp.float64).itemsize
+        rel_update_norm_partial_kernel((blocks,), (threads,),
             (
                 self.u,
                 self.unew,
@@ -366,8 +377,8 @@ class Laplace2DDistributedCUDAAwareMPI:
             ),
             shared_mem=shared_mem_bytes,
         )
-        local_diff2 = cp.sum(self.partial_diff)
-        local_norm2 = cp.sum(self.partial_norm)
+        local_diff2 = cp.sum(self.partial_diff[:blocks])
+        local_norm2 = cp.sum(self.partial_norm[:blocks])
         return local_diff2, local_norm2
 
 
@@ -379,9 +390,8 @@ class Laplace2DDistributedCUDAAwareMPI:
         as the serial CuPy RawKernel implementation.
         Global reduction uses CUDA-aware MPI Allreduce on a 2-element CuPy buffer.
         """
-        cp.cuda.nvtx.RangePush("compute_relative_l2_update_norm")
         rel_update_norm = 0.0
-        try:
+        with nvtx_range("compute_relative_l2_update_norm"):
             i0, i1 = self._owned_update_row_bounds()
             local_diff2, local_norm2 = self.compute_local_reduction_rawkernel(i0, i1)
             self.red_local[0] = local_diff2
@@ -392,19 +402,40 @@ class Laplace2DDistributedCUDAAwareMPI:
             diff2 = float(self.red_global[0].get())
             norm2 = float(self.red_global[1].get())
             rel_update_norm = np.sqrt(diff2) / max(np.sqrt(norm2), 1.0e-300)
-        finally:
-            cp.cuda.nvtx.RangePop()
         return float(rel_update_norm)
+
+
+    def reset_fields(self):
+        self.u.fill(0.0)
+        self.unew.fill(0.0)
+        self._apply_dirichlet_bc(self.u)
+        self._apply_dirichlet_bc(self.unew)
+        cp.cuda.get_current_stream().synchronize()
+        self.mpi_comm.Barrier()
+
+
+    def warmup(self):
+        """
+        Warm up RawKernel launch, reduction, and CUDA-aware MPI.
+        """
+        with nvtx_range("warmup"):
+            self.mpi_comm.Barrier()
+            self.exchange_halos_mpi()
+            self.jacobi_step()
+            _ = self.compute_relative_l2_update_norm()
+            cp.cuda.get_current_stream().synchronize()
+            self.mpi_comm.Barrier()
+        self.reset_fields()
+
 
     def run(self, max_iters, tol, check_every, fixed_iters=None):
         """
         Run Jacobi iteration.
         """
-        cp.cuda.nvtx.RangePush("run")
         rel_update_norm = np.inf
         niters = 0
         elapsed = 0.0
-        try:
+        with nvtx_range("run"):
             Laplace2DDistributedCUDAAwareMPI._validate_run_parameters(max_iters, tol, check_every, fixed_iters)
             nstop = fixed_iters if fixed_iters is not None else max_iters
             self.mpi_comm.Barrier()
@@ -430,8 +461,6 @@ class Laplace2DDistributedCUDAAwareMPI:
             self.mpi_comm.Barrier()
             elapsed_local = cp.cuda.get_elapsed_time(start, stop) / 1000.0
             elapsed = self.mpi_comm.allreduce(elapsed_local, op=MPI.MAX)
-        finally:
-            cp.cuda.nvtx.RangePop()
         return niters, rel_update_norm, elapsed
 
     def write_parallel_hdf5(self, filename, niters=None, rel_update_norm=None):
@@ -441,8 +470,7 @@ class Laplace2DDistributedCUDAAwareMPI:
             HDF5 write uses host memory. We explicitly copy local GPU slab
             to NumPy before entering HDF5.
         """
-        cp.cuda.nvtx.RangePush("write_parallel_hdf5")
-        try:
+        with nvtx_range("write_parallel_hdf5"):
             import h5py
             if not h5py.get_config().mpi:
                 raise RuntimeError(
@@ -481,8 +509,6 @@ class Laplace2DDistributedCUDAAwareMPI:
                 if rel_update_norm is not None:
                     dset.attrs["rel_update_norm"] = rel_update_norm
             self.mpi_comm.Barrier()
-        finally:
-            cp.cuda.nvtx.RangePop()
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -619,6 +645,13 @@ def main():
         print("", flush=True)
         print(f"  global field size : {global_bytes_per_array / 1024**2:.2f} MiB")
         print("", flush=True)
+
+    if rank == 0:
+        print("Warming up CuPy RawKernel + MPI...", flush=True)
+    solver.warmup()
+    if rank == 0:
+        print("Warm-up complete.", flush=True)
+
     niters, rel_update_norm, elapsed = solver.run(
         max_iters=args.max_iters,
         tol=args.tol,

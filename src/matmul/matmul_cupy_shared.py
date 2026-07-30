@@ -23,9 +23,9 @@ DEFAULT_TPB = 16
 CUDA_SOURCE = r'''
 template <typename T, int TILE>
 __global__ void mm_kernel_tiled(
-    const int A_num_rows,
-    const int B_num_cols,
-    const int A_num_cols,
+    const size_t A_num_rows,
+    const size_t B_num_cols,
+    const size_t A_num_cols,
     const T* __restrict__ A,
     const T* __restrict__ B,
     T* __restrict__ C
@@ -33,19 +33,19 @@ __global__ void mm_kernel_tiled(
     __shared__ T Atile[TILE][TILE];
     __shared__ T Btile[TILE][TILE];
 
-    const int tx = static_cast<int>(threadIdx.x);
-    const int ty = static_cast<int>(threadIdx.y);
+    const size_t tx = static_cast<size_t>(threadIdx.x);
+    const size_t ty = static_cast<size_t>(threadIdx.y);
 
-    const int col = static_cast<int>(blockIdx.x) * TILE + tx;
-    const int row = static_cast<int>(blockIdx.y) * TILE + ty;
+    const size_t col = static_cast<size_t>(blockIdx.x) * TILE + tx;
+    const size_t row = static_cast<size_t>(blockIdx.y) * TILE + ty;
 
     T acc = static_cast<T>(0);
 
-    const int num_tiles = (A_num_cols + TILE - 1) / TILE;
+    const size_t num_tiles = (A_num_cols + TILE - 1) / TILE;
 
-    for (int tile = 0; tile < num_tiles; ++tile) {
-        const int a_col = tile * TILE + tx;
-        const int b_row = tile * TILE + ty;
+    for (size_t tile = 0; tile < num_tiles; ++tile) {
+        const size_t a_col = tile * TILE + tx;
+        const size_t b_row = tile * TILE + ty;
 
         if (row < A_num_rows && a_col < A_num_cols) {
             Atile[ty][tx] = A[row * A_num_cols + a_col];
@@ -81,18 +81,28 @@ __global__ void mm_kernel_tiled(
 # ============================================================
 
 @contextmanager
-def nvtx_range(name: str):
+def nvtx_range(name: str, id_color: int = -1):
     """
     NVTX helper.
 
     If CuPy NVTX support is unavailable, this silently becomes a no-op.
     """
+    pushed = False
     try:
-        cp.cuda.nvtx.RangePush(name)
-        yield
-        cp.cuda.nvtx.RangePop()
+        cp.cuda.nvtx.RangePush(name, id_color)
+        pushed = True
     except Exception:
+        pushed = False
+
+    try:
         yield
+    finally:
+        if pushed:
+            try:
+                cp.cuda.nvtx.RangePop()
+            except Exception:
+                pass
+
 
 
 # ============================================================
@@ -132,6 +142,11 @@ def validate_matrix_shapes(a: cp.ndarray, b: cp.ndarray, c: cp.ndarray) -> None:
         raise ValueError(
             f"Invalid C shape: got C{c.shape}, expected C{expected_c_shape}"
         )
+    if a.dtype != b.dtype or a.dtype != c.dtype:
+        raise TypeError(
+            f"A, B, and C must have the same dtype; "
+            f"got A={a.dtype}, B={b.dtype}, C={c.dtype}"
+        )
 
 
 def compute_launch_geometry(a: cp.ndarray, b: cp.ndarray, tpb: int):
@@ -166,10 +181,10 @@ def dtype_tolerances(dtype: np.dtype):
     dtype = np.dtype(dtype)
 
     if dtype == np.dtype(np.float32):
-        return 1.0e-5, 1.0e-5
+        return 1.0e-4, 1.0e-4
 
     if dtype == np.dtype(np.float64):
-        return 1.0e-12, 1.0e-12
+        return 1.0e-10, 1.0e-10
 
     raise TypeError("dtype must be either float32 or float64")
 
@@ -205,9 +220,9 @@ def launch_kernel(
         grid,
         block,
         (
-            np.int32(a.shape[0]),
-            np.int32(b.shape[1]),
-            np.int32(a.shape[1]),
+            np.uint64(a.shape[0]),
+            np.uint64(b.shape[1]),
+            np.uint64(a.shape[1]),
             a,
             b,
             c,

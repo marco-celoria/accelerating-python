@@ -6,13 +6,33 @@ mpi4py.rc.thread_level = "funneled"
 from mpi4py import MPI
 import numpy as np
 from numba import cuda
-import nvtx
+from contextlib import contextmanager
+import cupy as cp
+
+
+@contextmanager
+def nvtx_range(name: str, id_color: int = -1):
+    pushed = False
+    try:
+        cp.cuda.nvtx.RangePush(name, id_color)
+        pushed = True
+    except Exception:
+        pushed = False
+
+    try:
+        yield
+    finally:
+        if pushed:
+            try:
+                cp.cuda.nvtx.RangePop()
+            except Exception:
+                pass
+
 
 
 TPB_X = 32
 TPB_Y = 8
 REDUCE_TPB = 256
-
 
 @cuda.reduce
 def sum_reduce(a, b):
@@ -243,16 +263,13 @@ class Laplace2DDistributedNumbaCUDAAwareMPI:
         Boundaries are initialized once in both arrays and are not overwritten
         because the CUDA kernel updates only interior points.
         """
-        rng_bc = nvtx.start_range(message="_apply_dirichlet_bc_host", color="blue")
-        try:
+        with nvtx_range("_apply_dirichlet_bc_host", id_color=1):
             arr[1 : self.local_ny + 1, 0] = self.bc_left
             arr[1 : self.local_ny + 1, self.nx - 1] = self.bc_right
             if self.rank == 0:
                 arr[1, :] = self.bc_bottom
             if self.rank == self.size - 1:
                 arr[self.local_ny, :] = self.bc_top
-        finally:
-            nvtx.end_range(rng_bc)
 
     def exchange_halos_mpi(self):
         """
@@ -261,8 +278,7 @@ class Laplace2DDistributedNumbaCUDAAwareMPI:
           - tag 100: upward send, rank r sends row 1 to rank r-1
           - tag 200: downward send, rank r sends row local_ny to rank r+1
         """
-        rng_mpi = nvtx.start_range(message="exchange_halos_mpi", color="purple")
-        try:
+        with nvtx_range("exchange_halos_mpi", id_color=2):
             # Required for portable CUDA-aware MPI behavior:
             # make sure previous GPU writes to d_u are visible to MPI.
             cuda.default_stream().synchronize()
@@ -288,15 +304,12 @@ class Laplace2DDistributedNumbaCUDAAwareMPI:
                 source=self.down,
                 recvtag=100,
             )
-        finally:
-            nvtx.end_range(rng_mpi)
 
     def jacobi_step(self):
         """
         One Numba CUDA Jacobi update.
         """
-        rng_step = nvtx.start_range(message="jacobi_step", color="orange")
-        try:
+        with nvtx_range("jacobi_step", id_color=3):
             i0, i1 = self._owned_update_row_bounds()
             if i0 >= i1:
                 return
@@ -305,8 +318,6 @@ class Laplace2DDistributedNumbaCUDAAwareMPI:
             jacobi_kernel[blocks, threads](
                 self.d_u, self.d_unew, self.nx, i0, i1, self.dx2, self.dy2, self.inv_denom,
             )
-        finally:
-            nvtx.end_range(rng_step)
 
     def compute_relative_l2_update_norm(self):
         """
@@ -314,9 +325,8 @@ class Laplace2DDistributedNumbaCUDAAwareMPI:
             ||u_new - u||_2 / ||u_new||_2
         over true global interior points only.
         """
-        rng_l2 = nvtx.start_range(message="jacobi_l2", color="green")
         rel_update_norm = 0.0
-        try:
+        with nvtx_range("jacobi_l2", id_color=4):
             i0, i1 = self._owned_update_row_bounds()
             local_diff2 = 0.0
             local_norm2 = 0.0
@@ -341,19 +351,44 @@ class Laplace2DDistributedNumbaCUDAAwareMPI:
             diff2 = self.h_global[0]
             norm2 = self.h_global[1]
             rel_update_norm = np.sqrt(diff2) / max(np.sqrt(norm2), 1.0e-300)
-        finally:
-            nvtx.end_range(rng_l2)
         return float(rel_update_norm)
+
+
+
+    def reset_fields(self):
+        h_u = np.zeros((self.local_ny + 2, self.nx), dtype=np.float64)
+        h_unew = np.zeros_like(h_u)
+        self._apply_dirichlet_bc_host(h_u)
+        self._apply_dirichlet_bc_host(h_unew)
+        self.d_u.copy_to_device(h_u)
+        self.d_unew.copy_to_device(h_unew)
+        cuda.synchronize()
+        self.mpi_comm.Barrier()
+
+
+    def warmup(self):
+        """
+        Warm up CUDA kernels, reductions, and MPI halo exchange.
+        Resets fields afterwards.
+        """
+        with nvtx_range("warmup", id_color=5):
+            self.mpi_comm.Barrier()
+            self.exchange_halos_mpi()
+            self.jacobi_step()
+            _ = self.compute_relative_l2_update_norm()
+            cuda.synchronize()
+            self.mpi_comm.Barrier()
+        self.reset_fields()
+
 
     def run(self, max_iters, tol, check_every, fixed_iters=None):
         """
         Run Jacobi iteration.
         """
-        rng_run = nvtx.start_range(message="jacobi_run", color="yellow")
         rel_update_norm = np.inf
         niters = 0
         elapsed = 0.0 
-        try:
+        with nvtx_range("jacobi_run", id_color=6):
             Laplace2DDistributedNumbaCUDAAwareMPI._validate_run_parameters(max_iters, tol, check_every, fixed_iters)
             nstop = fixed_iters if fixed_iters is not None else max_iters
             self.mpi_comm.Barrier()
@@ -379,8 +414,6 @@ class Laplace2DDistributedNumbaCUDAAwareMPI:
             self.mpi_comm.Barrier()
             elapsed_local = cuda.event_elapsed_time(start, stop) / 1000.0
             elapsed = self.mpi_comm.allreduce(elapsed_local, op=MPI.MAX)
-        finally:
-            nvtx.end_range(rng_run)
         return niters, rel_update_norm, elapsed
 
     def write_parallel_hdf5(self, filename, niters=None, rel_update_norm=None):
@@ -390,8 +423,7 @@ class Laplace2DDistributedNumbaCUDAAwareMPI:
             HDF5 write uses host memory. We explicitly copy local GPU slab
             to NumPy before entering HDF5.
         """
-        rng_write = nvtx.start_range(message="jacobi_write", color="red")
-        try:
+        with nvtx_range("jacobi_write", id_color=7):
             import h5py 
             if not h5py.get_config().mpi:
                 raise RuntimeError(
@@ -431,8 +463,6 @@ class Laplace2DDistributedNumbaCUDAAwareMPI:
                 if rel_update_norm is not None:
                     dset.attrs["rel_update_norm"] = rel_update_norm
             self.mpi_comm.Barrier()
-        finally:
-            nvtx.end_range(rng_write)
 
 
 def parse_args():
@@ -577,6 +607,13 @@ def main():
         print("", flush=True)
         print(f"  global field size : {global_bytes_per_array / 1024**2:.2f} MiB")
         print("", flush=True)
+
+    if rank == 0:
+        print("Warming up Numba CUDA + MPI...", flush=True)
+    solver.warmup()
+    if rank == 0:
+        print("Warm-up complete.", flush=True)
+
     niters, rel_update_norm, elapsed = solver.run(
         max_iters=args.max_iters,
         tol=args.tol,
