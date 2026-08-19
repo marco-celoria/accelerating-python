@@ -317,13 +317,19 @@ def main():
         check_every=args.check_every,
         fixed_iters=args.fixed_iters,
     )
-    print(f"iterations                : {niters}")
-    print(f"final relative update norm: {rel_update_norm:.6e}")
-    print(f"CuPy elapsed time [s]     : {elapsed:.6f}")
-    print(f"CuPy time per iter [ms]   : {1000.0 * elapsed / max(niters, 1):.6f}")
+    
+    global_updates_per_iter = (args.nx - 2) * (args.ny - 2)
+    gupdates_per_second = (global_updates_per_iter * niters / elapsed / 1.0e9 )
+
+    print(f"CuPy iterations                     : {niters}")
+    print(f"CuPy final relative update norm     : {rel_update_norm:.6e}")
+    print(f"CuPy elapsed time [s]               : {elapsed:.6f}")
+    print(f"CuPy time per iter [ms]             : {1000.0 * elapsed / max(niters, 1):.6f}")
+    print(f"CuPy Jacobi throughput [GUpdates/s] : {gupdates_per_second:.6f}")
+
     if args.output is not None:
         solver.write_hdf5(args.output, niters, rel_update_norm)
-        print(f"wrote solution            : {args.output}")
+        print(f"CuPy wrote solution                 : {args.output}")
     print("", flush=True)
 
 

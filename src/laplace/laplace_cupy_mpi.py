@@ -659,14 +659,21 @@ def main():
         fixed_iters=args.fixed_iters,
     )
     cp.cuda.get_current_stream().synchronize()
-    solver.write_parallel_hdf5(args.output, niters, rel_update_norm)
+    
+    if args.output is not None:
+        solver.write_parallel_hdf5(args.output, niters, rel_update_norm)
+    
+    global_updates_per_iter = (args.nx - 2) * (args.ny - 2)
+    gupdates_per_second = (global_updates_per_iter * niters / elapsed / 1.0e9 )
+
     if rank == 0:
         print("", flush=True)
-        print(f"iterations                  : {niters}")
-        print(f"final relative update norm  : {rel_update_norm:.6e}")
-        print(f"CuPy+MPI elapsed time [s]   : {elapsed:.6f}")
-        print(f"CuPy+MPI time per iter [ms] : {1000.0 * elapsed / max(niters, 1):.6f}")
-        print(f"wrote solution              : {args.output}")
+        print(f"RawCuPy+MPI iterations                     : {niters}")
+        print(f"RawCuPy+MPI final relative update norm     : {rel_update_norm:.6e}")
+        print(f"RawCuPy+MPI elapsed time [s]               : {elapsed:.6f}")
+        print(f"RawCuPy+MPI time per iter [ms]             : {1000.0 * elapsed / max(niters, 1):.6f}")
+        print(f"RawCuPy+MPI Jacobi throughput [GUpdates/s] : {gupdates_per_second:.6f}")
+        print(f"RawCuPy+MPI wrote solution                 : {args.output}")
         print("", flush=True)
 
 

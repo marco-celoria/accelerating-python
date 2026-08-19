@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
-import math
-import time
 from contextlib import contextmanager
+from time import perf_counter
 
 import cupy as cp
 import numpy as np
@@ -114,16 +113,49 @@ def validate_positive_int(name: str, value: int) -> None:
         raise ValueError(f"{name} must be > 0")
 
 
+#def validate_tpb(tpb: int) -> None:
+#    validate_positive_int("tpb", tpb)
+#
+#    threads_per_block = tpb * tpb
+#
+#    if threads_per_block > 1024:
+#        raise ValueError(
+#            f"tpb={tpb} gives {threads_per_block} threads/block, "
+#            "but CUDA allows at most 1024"
+#        )
+
+
 def validate_tpb(tpb: int) -> None:
     validate_positive_int("tpb", tpb)
 
-    threads_per_block = tpb * tpb
+    device = cp.cuda.Device()
+    attributes = device.attributes
 
-    if threads_per_block > 1024:
+    threads_per_block = tpb * tpb
+    max_threads_per_block = attributes["MaxThreadsPerBlock"]
+    max_block_dim_x = attributes["MaxBlockDimX"]
+    max_block_dim_y = attributes["MaxBlockDimY"]
+
+    if threads_per_block > max_threads_per_block:
         raise ValueError(
             f"tpb={tpb} gives {threads_per_block} threads/block, "
-            "but CUDA allows at most 1024"
+            f"but the device supports at most "
+            f"{max_threads_per_block}"
         )
+
+    if tpb > max_block_dim_x:
+        raise ValueError(
+            f"tpb={tpb} exceeds MaxBlockDimX={max_block_dim_x}"
+        )
+
+    if tpb > max_block_dim_y:
+        raise ValueError(
+            f"tpb={tpb} exceeds MaxBlockDimY={max_block_dim_y}"
+        )
+
+
+def shared_memory_bytes(tpb: int, dtype: np.dtype) -> int:
+    return 2 * tpb * tpb * np.dtype(dtype).itemsize
 
 
 def validate_matrix_shapes(a: cp.ndarray, b: cp.ndarray, c: cp.ndarray) -> None:
@@ -148,18 +180,27 @@ def validate_matrix_shapes(a: cp.ndarray, b: cp.ndarray, c: cp.ndarray) -> None:
             f"got A={a.dtype}, B={b.dtype}, C={c.dtype}"
         )
 
+    if not a.flags.c_contiguous:
+        raise ValueError("A must be C-contiguous")
+    if not b.flags.c_contiguous:
+        raise ValueError("B must be C-contiguous")
+    if not c.flags.c_contiguous:
+        raise ValueError("C must be C-contiguous")
+
+
 
 def compute_launch_geometry(a: cp.ndarray, b: cp.ndarray, tpb: int):
     rows_c = a.shape[0]
     cols_c = b.shape[1]
-
-    blocks_x = math.ceil(cols_c / tpb)
-    blocks_y = math.ceil(rows_c / tpb)
+    
+    blocks_x = (cols_c + tpb - 1) // tpb
+    blocks_y = (rows_c + tpb - 1) // tpb
 
     grid = (blocks_x, blocks_y)
     block = (tpb, tpb)
 
     return grid, block
+
 
 
 def flop_count_matmul(n: int, l: int, m: int) -> float:
@@ -212,20 +253,20 @@ def launch_kernel(
     kernel,
     grid,
     block,
-    a: cp.ndarray,
-    b: cp.ndarray,
-    c: cp.ndarray,
+    a_d: cp.ndarray,
+    b_d: cp.ndarray,
+    c_d: cp.ndarray,
 ) -> None:
     kernel(
         grid,
         block,
         (
-            np.uint64(a.shape[0]),
-            np.uint64(b.shape[1]),
-            np.uint64(a.shape[1]),
-            a,
-            b,
-            c,
+            np.uint64(a_d.shape[0]),
+            np.uint64(b_d.shape[1]),
+            np.uint64(a_d.shape[1]),
+            a_d,
+            b_d,
+            c_d,
         ),
     )
 
@@ -234,24 +275,22 @@ def gpu_kernel_time_seconds(
     kernel,
     grid,
     block,
-    a: cp.ndarray,
-    b: cp.ndarray,
-    c: cp.ndarray,
+    a_d: cp.ndarray,
+    b_d: cp.ndarray,
+    c_d: cp.ndarray,
+    start_event,
+    stop_event,
 ) -> float:
     """
     Time one CUDA kernel launch using CUDA events.
 
     CuPy reports event elapsed time in milliseconds.
     """
-    start_event = cp.cuda.Event()
-    stop_event = cp.cuda.Event()
-
-    cp.cuda.Device().synchronize()
 
     start_event.record()
 
-    with nvtx_range("GPU tiled shared-memory matmul"):
-        launch_kernel(kernel, grid, block, a, b, c)
+    with nvtx_range("Launch CuPy tiled RawKernel matmul"):
+        launch_kernel(kernel, grid, block, a_d, b_d, c_d)
 
     stop_event.record()
     stop_event.synchronize()
@@ -259,33 +298,63 @@ def gpu_kernel_time_seconds(
     return cp.cuda.get_elapsed_time(start_event, stop_event) * 1.0e-3
 
 
+def validate_selected_dtype(
+    a: cp.ndarray,
+    b: cp.ndarray,
+    c: cp.ndarray,
+    dtype: np.dtype,
+) -> None:
+    expected_dtype = np.dtype(dtype)
+
+    if (
+        np.dtype(a.dtype) != expected_dtype
+        or np.dtype(b.dtype) != expected_dtype
+        or np.dtype(c.dtype) != expected_dtype
+    ):
+        raise TypeError(
+            "A, B, and C must match the selected dtype; "
+            f"expected {expected_dtype}, got "
+            f"A={a.dtype}, B={b.dtype}, C={c.dtype}"
+        )
+
 # ============================================================
 # BENCHMARK DRIVER
 # ============================================================
 
 def matmul(
-    a: cp.ndarray,
-    b: cp.ndarray,
-    c: cp.ndarray,
+    a_d: cp.ndarray,
+    b_d: cp.ndarray,
+    c_d: cp.ndarray,
     iters: int,
     kernel,
     tpb: int,
     dtype: np.dtype,
-) -> None:
+) -> bool:
     validate_positive_int("iters", iters)
     validate_tpb(tpb)
-    validate_matrix_shapes(a, b, c)
-
-    grid, block = compute_launch_geometry(a, b, tpb)
+    validate_matrix_shapes(a_d, b_d, c_d)
+    validate_selected_dtype(a_d, b_d, c_d, dtype)
+    grid, block = compute_launch_geometry(a_d, b_d, tpb)
+    
+    shared_bytes = shared_memory_bytes(tpb, dtype)
+    device = cp.cuda.Device()
+    max_shared_bytes = device.attributes["MaxSharedMemoryPerBlock"]
+    if shared_bytes > max_shared_bytes:
+        raise ValueError(
+            f"Tile size {tpb}x{tpb} with dtype={np.dtype(dtype)} "
+            f"requires {shared_bytes} bytes of shared memory per block, "
+            f"but the device supports only {max_shared_bytes} bytes"
+        )
 
     print(f"blockspergrid   = {grid}")
     print(f"threadsperblock = {block}")
-    print(f"tile size        = {tpb} x {tpb}")
-
+    print(f"tile size       = {tpb} x {tpb}")
+    print(f"shared memory   = {shared_bytes} bytes/block")
+    
     # Copy inputs once for CPU reference.
     with nvtx_range("D2H input copies"):
-        a_h = cp.asnumpy(a)
-        b_h = cp.asnumpy(b)
+        a_h = cp.asnumpy(a_d)
+        b_h = cp.asnumpy(b_d)
 
     # Preallocate CPU reference output.
     check_h = np.empty((a_h.shape[0], b_h.shape[1]), dtype=dtype)
@@ -293,24 +362,30 @@ def matmul(
     # --------------------------------------------------------
     # Warm-up launch.
     #
-    # RawModule compilation happens when get_function() is called, but
-    # the first actual launch can still include setup overhead.
+    # The warm-up excludes compilation, module loading, and
+    # first-launch setup from the measured iterations. 
     # --------------------------------------------------------
     print("Warming up CUDA tiled kernel...")
 
     with nvtx_range("Warmup tiled shared-memory matmul"):
-        launch_kernel(kernel, grid, block, a, b, c)
+        launch_kernel(kernel, grid, block, a_d, b_d, c_d)
 
     cp.cuda.Device().synchronize()
 
-    print("Warmup complete. Timings below exclude first-launch overhead.")
+    print("Warming up CPU NumPy matmul...")
+
+    with nvtx_range("CPU NumPy warmup", id_color=4):
+        np.matmul(a_h, b_h, out=check_h)
+
+    print("Warmup complete.")
+    print("Timings below exclude RawModule compilation, first-launch overhead, and the initial NumPy matmul call.")
 
     timings_gpu = np.empty(iters, dtype=np.float64)
     timings_cpu = np.empty(iters, dtype=np.float64)
 
     rtol, atol = dtype_tolerances(dtype)
-
-    all_checks_passed = True
+    start_event = cp.cuda.Event()
+    stop_event = cp.cuda.Event()
 
     for i in range(iters):
         # ----------------------------------------------------
@@ -320,77 +395,129 @@ def matmul(
             kernel=kernel,
             grid=grid,
             block=block,
-            a=a,
-            b=b,
-            c=c,
+            a_d=a_d,
+            b_d=b_d,
+            c_d=c_d,
+            start_event=start_event,
+            stop_event=stop_event,
         )
 
-        # ----------------------------------------------------
-        # CPU timing with preallocated output
-        # ----------------------------------------------------
-        cpu_t0 = time.perf_counter()
-
+    # ----------------------------------------------------
+    # CPU timing with preallocated output
+    # ----------------------------------------------------
+    for i in range(iters):
         with nvtx_range("CPU NumPy matmul"):
+            cpu_t0 = perf_counter()
             np.matmul(a_h, b_h, out=check_h)
-
-        cpu_t1 = time.perf_counter()
+            cpu_t1 = perf_counter()
 
         timings_cpu[i] = cpu_t1 - cpu_t0
 
-        # ----------------------------------------------------
-        # Correctness check
-        # ----------------------------------------------------
-        with nvtx_range("D2H result copy"):
-            c_h = cp.asnumpy(c)
 
-        ok = np.allclose(c_h, check_h, rtol=rtol, atol=atol)
-        all_checks_passed = all_checks_passed and ok
-
-        err_norm = np.linalg.norm(c_h - check_h)
-        err_max = np.max(np.abs(c_h - check_h))
-
+    for i in range(iters):
         print(
             f"Iteration {i + 1}/{iters}: "
-            f"check={ok}, "
-            f"norm_error={err_norm:.6e}, "
-            f"max_abs_error={err_max:.6e}, "
             f"gpu_time={timings_gpu[i]:.6e} s, "
             f"cpu_time={timings_cpu[i]:.6e} s"
         )
 
-    gpu_mean = float(timings_gpu.mean())
-    gpu_std = float(timings_gpu.std())
-    cpu_mean = float(timings_cpu.mean())
-    cpu_std = float(timings_cpu.std())
 
-    n = a.shape[0]
-    l = a.shape[1]
-    m = b.shape[1]
+    # ----------------------------------------------------
+    # Correctness check
+    # ----------------------------------------------------
+    with nvtx_range("D2H result copy"):
+        c_h = cp.asnumpy(c_d)
+
+    gpu_finite = bool(np.isfinite(c_h).all())
+    cpu_finite = bool(np.isfinite(check_h).all())
+    finite = gpu_finite and cpu_finite
+
+    if finite:
+        diff = c_h - check_h
+        diff_norm = float(np.linalg.norm(diff))
+        ref_norm = float(np.linalg.norm(check_h))
+        err_max = float(np.max(np.abs(diff)))
+
+        relative_error = (
+            diff_norm / ref_norm
+            if ref_norm != 0.0
+            else diff_norm
+        )
+
+        check_passed = bool(
+            np.allclose(
+                c_h,
+                check_h,
+                rtol=rtol,
+                atol=atol,
+            )
+        )
+    else:
+        diff_norm = float("nan")
+        ref_norm = float("nan")
+        err_max = float("nan")
+        relative_error = float("nan")
+        check_passed = False
+
+    print()
+    print("Correctness validation")
+    print(f"GPU result finite:   {gpu_finite}")
+    print(f"CPU result finite:   {cpu_finite}")
+    print(f"Both results finite: {finite}")
+    print(f"Check passed:        {check_passed}")
+    print(f"Error norm:          {diff_norm:.6e}")
+    print(f"Maximum abs. error:  {err_max:.6e}")
+    print(f"Relative error:      {relative_error:.6e}")
+    print(f"rtol:                {rtol:.6e}")
+    print(f"atol:                {atol:.6e}")
+
+    gpu_mean = float(np.mean(timings_gpu))
+    gpu_median = float(np.median(timings_gpu))
+    gpu_min = float(np.min(timings_gpu))
+    gpu_std = (float(np.std(timings_gpu, ddof=1)) if iters > 1 else 0.0)
+
+    cpu_mean = float(np.mean(timings_cpu))
+    cpu_median = float(np.median(timings_cpu))
+    cpu_min = float(np.min(timings_cpu))
+    cpu_std = (float(np.std(timings_cpu, ddof=1)) if iters > 1 else 0.0)
+
+    n = a_d.shape[0]
+    l = a_d.shape[1]
+    m = b_d.shape[1]
 
     flops = flop_count_matmul(n, l, m)
     gflops = flops * 1.0e-9
 
-    gpu_gflops_s = gflops / gpu_mean
-    cpu_gflops_s = gflops / cpu_mean
+    gpu_gflops_s = gflops / gpu_median
+    cpu_gflops_s = gflops / cpu_median
+    speedup = cpu_median / gpu_median
 
     print()
     print("============================================================")
     print("Benchmark summary")
     print("============================================================")
-    print(f"Matrix shapes:       A={a.shape}, B={b.shape}, C={c.shape}")
-    print(f"dtype:               {np.dtype(dtype)}")
-    print(f"iterations:          {iters}")
-    print(f"tile size:           {tpb} x {tpb}")
-    print(f"FLOPs per matmul:    {flops:.0f}")
-    print(f"All checks passed:   {all_checks_passed}")
-    print(f"GPU elapsed mean:    {gpu_mean:.6e} s")
-    print(f"GPU elapsed std:     {gpu_std:.6e} s")
-    print(f"CPU elapsed mean:    {cpu_mean:.6e} s")
-    print(f"CPU elapsed std:     {cpu_std:.6e} s")
-    print(f"Speedup:             {cpu_mean / gpu_mean:.2f}x")
-    print(f"GPU GFLOP/s:         {gpu_gflops_s:.4f}")
-    print(f"CPU GFLOP/s:         {cpu_gflops_s:.4f}")
-
+    print("Timing scope:         compute only")
+    print("GPU timing method:    CUDA events")
+    print("CPU timing method:    perf_counter")
+    print("Transfers included:   no")
+    print("Compilation included: no")
+    print(f"Matrix shapes:        A={a_d.shape}, B={b_d.shape}, C={c_d.shape}")
+    print(f"dtype:                {np.dtype(dtype)}")
+    print(f"iterations:           {iters}")
+    print(f"Useful scalar FLOPs:  {flops:.0f}")
+    print(f"GPU elapsed mean:     {gpu_mean:.6e} s")
+    print(f"GPU elapsed median:   {gpu_median:.6e} s")
+    print(f"GPU elapsed minimum:  {gpu_min:.6e} s")
+    print(f"GPU elapsed stddev:   {gpu_std:.6e} s")
+    print(f"CPU elapsed mean:     {cpu_mean:.6e} s")
+    print(f"CPU elapsed median:   {cpu_median:.6e} s")
+    print(f"CPU elapsed minimum:  {cpu_min:.6e} s")
+    print(f"CPU elapsed stddev:   {cpu_std:.6e} s")
+    print(f"Compute-only speedup: {speedup:.2f}x")
+    print(f"GPU GFLOP/s median:   {gpu_gflops_s:.4f}")
+    print(f"CPU GFLOP/s median:   {cpu_gflops_s:.4f}")
+    print(f"Check passed:         {check_passed}")
+    return check_passed
 
 # ============================================================
 # MAIN
@@ -431,7 +558,7 @@ def main() -> int:
         "iters",
         nargs="?",
         type=int,
-        default=1,
+        default=10,
         help="Number of benchmark iterations",
     )
 
@@ -460,15 +587,15 @@ def main() -> int:
     )
 
     args = parser.parse_args()
-
+    
     validate_positive_int("n", args.n)
     validate_positive_int("m", args.m)
     validate_positive_int("l", args.l)
     validate_positive_int("iters", args.iters)
-    validate_tpb(args.tpb)
-
+    validate_positive_int("tpb", args.tpb)
     if cp.cuda.runtime.getDeviceCount() <= 0:
         raise RuntimeError("No CUDA device found")
+    validate_tpb(args.tpb)
 
     if args.dtype == "float32":
         dtype_cp = cp.float32
@@ -509,18 +636,19 @@ def main() -> int:
     else:
         raise TypeError("dtype must be either float32 or float64")
 
-    matmul(
-        a=x_d,
-        b=y_d,
-        c=z_d,
+    check_passed = matmul(
+        a_d=x_d,
+        b_d=y_d,
+        c_d=z_d,
         iters=args.iters,
         kernel=kernel,
         tpb=tpb,
         dtype=dtype_np,
     )
 
-    return 0
+    return 0 if check_passed else 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

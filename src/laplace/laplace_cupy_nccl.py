@@ -955,27 +955,22 @@ def main():
         check_every=args.check_every,
         fixed_iters=args.fixed_iters,
     )
-
-    solver.write_parallel_hdf5(
-        args.output,
-        niters=niters,
-        rel_update_norm=rel_update_norm,
-    )
+    
+    if args.output is not None:
+        solver.write_parallel_hdf5(args.output, niters=niters, rel_update_norm=rel_update_norm)
+    
+    global_updates_per_iter = (args.nx - 2) * (args.ny - 2)
+    gupdates_per_second = (global_updates_per_iter * niters / elapsed / 1.0e9 )
 
     if rank == 0:
         print("", flush=True)
-        print(f"iterations                   : {niters}")
-        print(
-            f"final relative update norm   : {rel_update_norm:.6e}"
-        )
-        print(f"CuPy+NCCL elapsed time [s]   : {elapsed:.6f}")
-        print(
-            f"CuPy+NCCL time per iter [ms] : "
-            f"{1000.0 * elapsed / max(niters, 1):.6f}"
-        )
-        print(f"wrote solution               : {args.output}")
+        print(f"RawCuPy+NCCL iterations                     : {niters}")
+        print(f"RawCuPy+NCCL final relative update norm     : {rel_update_norm:.6e}")
+        print(f"RawCuPy+NCCL elapsed time [s]               : {elapsed:.6f}")
+        print(f"RawCuPy+NCCL time per iter [ms]             : {1000.0 * elapsed / max(niters, 1):.6f}")
+        print(f"RawCuPy+NCCL Jacobi throughput [GUpdates/s] : {gupdates_per_second:.6f}")
+        print(f"RawCuPy+NCCL wrote solution                 : {args.output}")
         print("", flush=True)
-
 
 if __name__ == "__main__":
     main()
