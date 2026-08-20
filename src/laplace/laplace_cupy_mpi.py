@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-import os
+
 import argparse
-import mpi4py
-mpi4py.rc.thread_level = "funneled"
-from mpi4py import MPI
-import numpy as np
-import cupy as cp
+import os
 from contextlib import contextmanager
+
+import mpi4py
+
+mpi4py.rc.thread_level = "funneled"
+
+from mpi4py import MPI
+
+import cupy as cp
+import numpy as np
+
 # This example requires CUDA-aware MPI.
 # If the MPI library is not CUDA-aware,
 # passing CuPy arrays directly to Sendrecv/Allreduce
@@ -231,13 +237,59 @@ class Laplace2DDistributedCUDAAwareMPI:
         # red[1] = global squared solution norm
         self.red_local = cp.zeros(2, dtype=cp.float64)
         self.red_global = cp.zeros(2, dtype=cp.float64)
+        self.update_i0, self.update_i1 = self._owned_update_row_bounds()
+        self.local_update_count = (max(0, self.update_i1 - self.update_i0) * (self.nx - 2))
         self.rel_update_norm_threads = 256
+        if self.local_update_count > 0:
+            self.rel_update_norm_blocks = min(4096,(self.local_update_count + self.rel_update_norm_threads - 1) // self.rel_update_norm_threads,)
+        else:
+            self.rel_update_norm_blocks = 1
+
         if self.rel_update_norm_threads & (self.rel_update_norm_threads - 1) != 0:
             raise ValueError("rel_update_norm_threads must be a power of two")
-        max_local_interior = self.local_ny * (self.nx - 2)
-        self.rel_update_norm_blocks = min(4096, (max_local_interior + self.rel_update_norm_threads - 1) // self.rel_update_norm_threads,)
+
+        self.jacobi_threads = (32, 8)
+        if self.update_i0 < self.update_i1:
+            self.jacobi_blocks = ( 
+                (self.nx - 2 + self.jacobi_threads[0] - 1) // self.jacobi_threads[0],
+                (self.update_i1 - self.update_i0 + self.jacobi_threads[1] - 1) // self.jacobi_threads[1],
+            )
+        else:
+            self.jacobi_blocks = None
+        
+        self.rel_update_norm_shared_bytes = (2 * self.rel_update_norm_threads * cp.dtype(cp.float64).itemsize)
+        self.local_update_count_kernel = np.uint64(self.local_update_count)
+
+        self.nx_kernel = np.uint64(self.nx)
+        self.update_i0_kernel = np.uint64(self.update_i0)
+        self.update_i1_kernel = np.uint64(self.update_i1)
+        self.dx2_kernel = np.float64(self.dx2)
+        self.dy2_kernel = np.float64(self.dy2)
+        self.inv_denom_kernel = np.float64(self.inv_denom)
+        self._validate_kernel_configuration()
         self.partial_diff = cp.empty(self.rel_update_norm_blocks, dtype=cp.float64)
         self.partial_norm = cp.empty(self.rel_update_norm_blocks, dtype=cp.float64)
+
+    def _validate_kernel_configuration(self):
+        attributes = cp.cuda.Device().attributes
+        jacobi_threads_per_block = (self.jacobi_threads[0] * self.jacobi_threads[1])
+        if jacobi_threads_per_block > attributes["MaxThreadsPerBlock"]:
+            raise ValueError(f"Jacobi block requires {jacobi_threads_per_block} threads. "
+                             f"But the device supports only {attributes['MaxThreadsPerBlock']}")
+        
+        if self.jacobi_threads[0] > attributes["MaxBlockDimX"]:
+            raise ValueError(f"Jacobi block X dimension {self.jacobi_threads[0]} exceeds MaxBlockDimX={attributes['MaxBlockDimX']}")  
+        
+        if self.jacobi_threads[1] > attributes["MaxBlockDimY"]:
+            raise ValueError(f"Jacobi block Y dimension {self.jacobi_threads[1]} exceeds MaxBlockDimY={attributes['MaxBlockDimY']}")
+        
+        if self.rel_update_norm_threads > attributes["MaxThreadsPerBlock"]:
+            raise ValueError(f"Reduction block requires {self.rel_update_norm_threads} threads. "
+                             f"But the device supports only {attributes['MaxThreadsPerBlock']}")
+
+        if self.rel_update_norm_shared_bytes > attributes["MaxSharedMemoryPerBlock"]:
+            raise ValueError(f"Reduction requires {self.rel_update_norm_shared_bytes} bytes of shared memory. "
+                             f"But the device supports only {attributes['MaxSharedMemoryPerBlock']} bytes")
 
     @staticmethod
     def _validate_problem_parameters(nx, ny, lx, ly, bc_left, bc_right, bc_bottom, bc_top, dtype):
@@ -263,11 +315,12 @@ class Laplace2DDistributedCUDAAwareMPI:
 
     @staticmethod
     def _validate_run_parameters(max_iters, tol, check_every, fixed_iters):
-        if not isinstance(max_iters, int):
+        integer_types = (int, np.integer)
+        if not isinstance(max_iters, integer_types):
             raise TypeError("max_iters must be an integer")
-        if not isinstance(check_every, int):
+        if not isinstance(check_every, integer_types):
             raise TypeError("check_every must be an integer")
-        if fixed_iters is not None and not isinstance(fixed_iters, int):
+        if fixed_iters is not None and not isinstance(fixed_iters, integer_types):
             raise TypeError("fixed_iters must be an integer")
         if max_iters < 1:
             raise ValueError("max_iters must be at least 1")
@@ -348,37 +401,35 @@ class Laplace2DDistributedCUDAAwareMPI:
         """
         One RawKernel Jacobi update.
         """
+        if self.jacobi_blocks is None:
+            return
         with nvtx_range("jacobi_step"):
-            i0, i1 = self._owned_update_row_bounds()
-            if i0 >= i1:
-                return
-            threads = (32, 8)
-            blocks = ((self.nx - 2 + threads[0] - 1) // threads[0], (i1 - i0 + threads[1] - 1) // threads[1],)
-            jacobi_kernel(blocks, threads,
-                (self.u, self.unew, np.uint64(self.nx), np.uint64(i0), np.uint64(i1), self.dx2, self.dy2, self.inv_denom,),)
+            jacobi_kernel(
+                self.jacobi_blocks, self.jacobi_threads,
+                (
+                    self.u, self.unew, self.nx_kernel, 
+                    self.update_i0_kernel, self.update_i1_kernel, 
+                    self.dx2_kernel, self.dy2_kernel, self.inv_denom_kernel,
+                ),
+            )
 
-
-    def compute_local_reduction_rawkernel(self, i0, i1):
-        n = max(0, (i1 - i0) * (self.nx - 2))
-        if n == 0:
+    def compute_local_reduction_rawkernel(self):
+        if self.local_update_count == 0:
             return cp.asarray(0.0, dtype=cp.float64), cp.asarray(0.0, dtype=cp.float64)
-        threads = self.rel_update_norm_threads
-        blocks = min(4096, (n + threads - 1) // threads)
-        shared_mem_bytes = 2 * threads * cp.dtype(cp.float64).itemsize
-        rel_update_norm_partial_kernel((blocks,), (threads,),
+        rel_update_norm_partial_kernel((self.rel_update_norm_blocks,), (self.rel_update_norm_threads,),
             (
                 self.u,
                 self.unew,
                 self.partial_diff,
                 self.partial_norm,
-                np.uint64(self.nx),
-                np.uint64(i0),
-                np.uint64(n),
+                self.nx_kernel,
+                self.update_i0_kernel,
+                self.local_update_count_kernel,
             ),
-            shared_mem=shared_mem_bytes,
+            shared_mem=self.rel_update_norm_shared_bytes,
         )
-        local_diff2 = cp.sum(self.partial_diff[:blocks])
-        local_norm2 = cp.sum(self.partial_norm[:blocks])
+        local_diff2 = cp.sum(self.partial_diff[:self.rel_update_norm_blocks])
+        local_norm2 = cp.sum(self.partial_norm[:self.rel_update_norm_blocks])
         return local_diff2, local_norm2
 
 
@@ -390,10 +441,8 @@ class Laplace2DDistributedCUDAAwareMPI:
         as the serial CuPy RawKernel implementation.
         Global reduction uses CUDA-aware MPI Allreduce on a 2-element CuPy buffer.
         """
-        rel_update_norm = 0.0
         with nvtx_range("compute_relative_l2_update_norm"):
-            i0, i1 = self._owned_update_row_bounds()
-            local_diff2, local_norm2 = self.compute_local_reduction_rawkernel(i0, i1)
+            local_diff2, local_norm2 = self.compute_local_reduction_rawkernel()
             self.red_local[0] = local_diff2
             self.red_local[1] = local_norm2
             # Required before CUDA-aware MPI reads red_local.
@@ -401,8 +450,7 @@ class Laplace2DDistributedCUDAAwareMPI:
             self.mpi_comm.Allreduce(self.red_local, self.red_global, op=MPI.SUM,)
             diff2 = float(self.red_global[0].get())
             norm2 = float(self.red_global[1].get())
-            rel_update_norm = np.sqrt(diff2) / max(np.sqrt(norm2), 1.0e-300)
-        return float(rel_update_norm)
+            return float(np.sqrt(diff2) / max(np.sqrt(norm2), 1.0e-300))
 
 
     def reset_fields(self):
@@ -434,34 +482,35 @@ class Laplace2DDistributedCUDAAwareMPI:
         """
         rel_update_norm = np.inf
         niters = 0
-        elapsed = 0.0
         with nvtx_range("run"):
-            Laplace2DDistributedCUDAAwareMPI._validate_run_parameters(max_iters, tol, check_every, fixed_iters)
-            nstop = fixed_iters if fixed_iters is not None else max_iters
-            self.mpi_comm.Barrier()
+            self._validate_run_parameters(max_iters, tol, check_every, fixed_iters)
+            iteration_limit = fixed_iters if fixed_iters is not None else max_iters
             start = cp.cuda.Event()
             stop = cp.cuda.Event()
             cp.cuda.get_current_stream().synchronize()
+            self.mpi_comm.Barrier()
+            wall_t0 = MPI.Wtime()
             start.record()
-            for it in range(1, nstop + 1):
+            for it in range(1, iteration_limit + 1):
                 self.exchange_halos_mpi()
                 self.jacobi_step()
-                do_check = (it == 1 or it % check_every == 0 or it == nstop)
+                do_check = (it == 1 or it % check_every == 0 or it == iteration_limit)
+                converged = False
                 if do_check:
                     rel_update_norm = self.compute_relative_l2_update_norm()
-                    if fixed_iters is None and rel_update_norm < tol:
-                        # Keep the converged field in self.u for output.
-                        self.u, self.unew = self.unew, self.u
-                        niters = it
-                        break
+                    converged = (fixed_iters is None and rel_update_norm < tol)
                 self.u, self.unew = self.unew, self.u
                 niters = it
+                if converged:
+                    break
             stop.record()
             stop.synchronize()
+            elapsed_cuda_local = cp.cuda.get_elapsed_time(start, stop) / 1000.0
             self.mpi_comm.Barrier()
-            elapsed_local = cp.cuda.get_elapsed_time(start, stop) / 1000.0
-            elapsed = self.mpi_comm.allreduce(elapsed_local, op=MPI.MAX)
-        return niters, rel_update_norm, elapsed
+            elapsed_wall_local = MPI.Wtime() - wall_t0
+            elapsed_cuda_max = self.mpi_comm.allreduce(elapsed_cuda_local, op=MPI.MAX)
+            elapsed_wall_max = self.mpi_comm.allreduce(elapsed_wall_local, op=MPI.MAX)
+        return niters, rel_update_norm, elapsed_cuda_max, elapsed_wall_max
 
     def write_parallel_hdf5(self, filename, niters=None, rel_update_norm=None):
         """
@@ -478,7 +527,6 @@ class Laplace2DDistributedCUDAAwareMPI:
                     "Rebuild h5py against parallel HDF5 with HDF5_MPI=ON."
                 )
             self.mpi_comm.Barrier()
-            cp.cuda.get_current_stream().synchronize()
             local_host = cp.asnumpy(self.u[1 : self.local_ny + 1, :])
             with h5py.File(filename, "w", driver="mpio", comm=self.mpi_comm) as f:
                 dset = f.create_dataset(
@@ -528,7 +576,7 @@ def parse_args():
     parser.add_argument("--bc-right", type=float, default=1.0)
     parser.add_argument("--bc-bottom", type=float, default=0.0)
     parser.add_argument("--bc-top", type=float, default=0.0)
-    parser.add_argument("--output", type=str, default="laplace.h5")
+    parser.add_argument("--output", type=str, default=None, help="Optional parallel HDF5 output filename.",)
     parser.add_argument("--fixed-iters", type=int, default=None,
         help="Run exactly this many iterations, ignoring tolerance.",
     )
@@ -550,10 +598,14 @@ def validate_common_args(args, mpi_comm):
         if rank == 0:
             print("Error: lx and ly must be positive", flush=True)
         mpi_comm.Abort(1)
-    if size > args.ny - 2:
+    if size > args.ny:
         if rank == 0:
-            print("Error: number of MPI ranks must be <= ny - 2, but boundary-only ranks are possible with full-row decomposition", flush=True)
+            print("Error: number of MPI ranks must be <= ny for full-row decomposition.", flush=True,)
         mpi_comm.Abort(1)
+    
+    if rank == 0 and size > args.ny - 2:
+        print("Warning: one or more MPI ranks own only physical boundary rows and perform no Jacobi updates.", flush=True,)
+
     if args.max_iters < 1:
         if rank == 0:
             print("Error: max_iters must be at least 1", flush=True)
@@ -584,30 +636,49 @@ def main():
     validate_common_args(args, mpi_comm)
     rank = mpi_comm.Get_rank()
     size = mpi_comm.Get_size()
-    local_rank = get_local_rank(mpi_comm)
-    ndev = cp.cuda.runtime.getDeviceCount()
-    if ndev <= 0:
-        raise RuntimeError("No CUDA devices found")
-    if local_rank >= ndev:
+    provided_thread_level = MPI.Query_thread()
+    if provided_thread_level < MPI.THREAD_FUNNELED:
         if rank == 0:
-            print("Error: more local MPI ranks than visible CUDA devices.\n"
-                  "Use one MPI rank per GPU or explicitly allow oversubscription.", 
-                  flush=True,
-                 )
+            print("Error: MPI did not provide MPI_THREAD_FUNNELED.", flush=True,)
         mpi_comm.Abort(1)
-    cp.cuda.Device(local_rank).use()
-    solver = Laplace2DDistributedCUDAAwareMPI(
-        nx=args.nx,
-        ny=args.ny,
-        lx=args.lx,
-        ly=args.ly,
-        mpi_comm=mpi_comm,
-        bc_left=args.bc_left,
-        bc_right=args.bc_right,
-        bc_bottom=args.bc_bottom,
-        bc_top=args.bc_top,
-        dtype=cp.float64,
-    )
+
+    try:
+        local_rank = get_local_rank(mpi_comm)
+    except Exception as exc:
+        print(f"rank {rank}: failed to determine local rank: {exc}", flush=True,)
+        mpi_comm.Abort(1)
+    
+    try:
+        ndev = cp.cuda.runtime.getDeviceCount()
+    except Exception as exc:
+        print(f"rank {rank}: failed to query visible CUDA devices: {exc}", flush=True,)
+        mpi_comm.Abort(1)
+    if ndev <= 0:
+        print(f"rank {rank}: no visible CUDA devices", flush=True,)
+        mpi_comm.Abort(1)
+
+    if local_rank >= ndev:
+        print(f"rank {rank}: local_rank={local_rank} is out of range; visible CUDA devices on this node: {ndev}. "
+               "Use one MPI rank per GPU or explicitly allow oversubscription.", flush=True,)
+        mpi_comm.Abort(1)
+
+    try:
+        cp.cuda.Device(local_rank).use()
+        solver = Laplace2DDistributedCUDAAwareMPI(
+            nx=args.nx,
+            ny=args.ny,
+            lx=args.lx,
+            ly=args.ly,
+            mpi_comm=mpi_comm,
+            bc_left=args.bc_left,
+            bc_right=args.bc_right,
+            bc_bottom=args.bc_bottom,
+            bc_top=args.bc_top,
+            dtype=cp.float64,
+        )
+    except Exception as exc:
+        print(f"rank {rank}: solver initialization failed: {exc}", flush=True,)
+        mpi_comm.Abort(1)
     if rank == 0:
         print("Distributed CuPy RawKernel / CUDA-aware MPI Laplace solver")
         print(f"  global grid       : ny={args.ny}, nx={args.nx}")
@@ -627,8 +698,14 @@ def main():
     props = cp.cuda.runtime.getDeviceProperties(device_id)
     raw_name = props["name"]
     gpu_name = raw_name.decode() if isinstance(raw_name, bytes) else str(raw_name)
-    local_bytes_per_array  = ((solver.local_ny + 2) * solver.nx * cp.dtype(cp.float64).itemsize)
-    global_bytes_per_array = (args.ny * args.nx * cp.dtype(cp.float64).itemsize)
+
+    itemsize = np.dtype(np.float64).itemsize
+    local_field_bytes = ((solver.local_ny + 2) * solver.nx * itemsize)
+    partial_bytes = (2 * solver.rel_update_norm_blocks * itemsize)
+    reduction_buffer_bytes = 4 * itemsize
+    explicit_local_device_bytes = (2 * local_field_bytes + partial_bytes + reduction_buffer_bytes)
+    global_bytes_per_array = (args.ny * args.nx * itemsize)
+
     ordered_print(mpi_comm,
         (
             f"rank {rank:4d}/{size} | "
@@ -638,7 +715,8 @@ def main():
             f"global rows [{solver.ystart}:{solver.yend}) | "
             f"local_ny={solver.local_ny} | "
             f"local array={solver.u.shape} | "
-            f"memory/field={local_bytes_per_array / 1024**2:.2f} MiB"
+            f"memory/field={local_field_bytes / 1024**2:.2f} MiB | "
+            f"explicit_device={explicit_local_device_bytes / 1024**2:.2f} MiB"
         ),
     )
     if rank == 0:
@@ -648,33 +726,60 @@ def main():
 
     if rank == 0:
         print("Warming up CuPy RawKernel + MPI...", flush=True)
-    solver.warmup()
+    
+    try:
+        solver.warmup()
+    except Exception as exc:
+        print(f"rank {rank}: CUDA-aware MPI warm-up failed: {exc}", flush=True,)
+        mpi_comm.Abort(1)
+    
     if rank == 0:
         print("Warm-up complete.", flush=True)
-
-    niters, rel_update_norm, elapsed = solver.run(
-        max_iters=args.max_iters,
-        tol=args.tol,
-        check_every=args.check_every,
-        fixed_iters=args.fixed_iters,
-    )
-    cp.cuda.get_current_stream().synchronize()
     
-    if args.output is not None:
-        solver.write_parallel_hdf5(args.output, niters, rel_update_norm)
+    try:
+        niters, rel_update_norm, elapsed_cuda_event, elapsed_wall = solver.run(
+            max_iters=args.max_iters,
+            tol=args.tol,
+            check_every=args.check_every,
+            fixed_iters=args.fixed_iters,
+        )
+    except Exception as exc:
+        print(f"rank {rank}: solver run failed: {exc}", flush=True,)
+        mpi_comm.Abort(1)
     
-    global_updates_per_iter = (args.nx - 2) * (args.ny - 2)
-    gupdates_per_second = (global_updates_per_iter * niters / elapsed / 1.0e9 )
+    converged = (args.fixed_iters is None and rel_update_norm < args.tol)
+    global_updates_per_iter = ((args.nx - 2) * (args.ny - 2))
+    total_updates = global_updates_per_iter * niters
+    gupdates_per_second_cuda_event = (total_updates / elapsed_cuda_event / 1.0e9 if elapsed_cuda_event > 0.0 else float("inf"))
+    gupdates_per_second_wall       = (total_updates / elapsed_wall       / 1.0e9 if elapsed_wall       > 0.0 else float("inf"))
 
     if rank == 0:
-        print("", flush=True)
-        print(f"RawCuPy+MPI iterations                     : {niters}")
-        print(f"RawCuPy+MPI final relative update norm     : {rel_update_norm:.6e}")
-        print(f"RawCuPy+MPI elapsed time [s]               : {elapsed:.6f}")
-        print(f"RawCuPy+MPI time per iter [ms]             : {1000.0 * elapsed / max(niters, 1):.6f}")
-        print(f"RawCuPy+MPI Jacobi throughput [GUpdates/s] : {gupdates_per_second:.6f}")
-        print(f"RawCuPy+MPI wrote solution                 : {args.output}")
-        print("", flush=True)
+        print()
+        print("============================================================", flush=True)
+        print("Solver summary", flush=True)
+        print("============================================================", flush=True)
+        print(f"CuPy RawKernel + MPI iterations                  : {niters}", flush=True)
+        if args.fixed_iters is None:
+            print(f"CuPy RawKernel + MPI converged                   : {converged}", flush=True,)
+        else:
+            print( "CuPy RawKernel + MPI convergence used            : no", flush=True,)
+
+        print(f"CuPy RawKernel + MPI final relative update norm  : {rel_update_norm:.6e}", flush=True,)
+        print(f"CuPy RawKernel + MPI CUDA-event interval [s]     : {elapsed_cuda_event:.6f}", flush=True)
+        print(f"CuPy RawKernel + MPI wall elapsed time [s]       : {elapsed_wall:.6f}", flush=True)
+        print(f"CuPy RawKernel + MPI CUDA-event time/iter [ms]   : {1000.0 * elapsed_cuda_event / max(niters, 1):.6f}", flush=True,)
+        print(f"CuPy RawKernel + MPI wall time/iter [ms]         : {1000.0 * elapsed_wall / max(niters, 1):.6f}", flush=True,)
+        print(f"CuPy RawKernel + MPI CUDA-event GUpdates/s       : {gupdates_per_second_cuda_event:.6f}", flush=True)
+        print(f"CuPy RawKernel + MPI wall GUpdates/s             : {gupdates_per_second_wall:.6f}", flush=True)
+    if args.output is not None:
+        try:
+            solver.write_parallel_hdf5(args.output, niters, rel_update_norm,)
+        except Exception as exc:
+            print(f"rank {rank}: parallel HDF5 output failed: {exc}", flush=True,)
+            mpi_comm.Abort(1)
+        if rank == 0:
+            print(f"CuPy RawKernel + MPI wrote solution             : {args.output}", flush=True)
+            print("", flush=True)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 import argparse
+from contextlib import contextmanager
+from time import perf_counter
+
 import numpy as np
 from numba import cuda
-from contextlib import contextmanager
-import cupy as cp
+
+try:
+    import cupy as cp
+except ImportError:
+    cp = None
 
 
 @contextmanager
 def nvtx_range(name: str, id_color: int = -1):
+    if cp is None:
+        yield
+        return
+
     pushed = False
+
     try:
         cp.cuda.nvtx.RangePush(name, id_color)
         pushed = True
@@ -25,7 +36,6 @@ def nvtx_range(name: str, id_color: int = -1):
                 pass
 
 
-
 TPB_X = 32
 TPB_Y = 8
 REDUCE_TPB = 256
@@ -38,11 +48,11 @@ def sum_reduce(a, b):
 @cuda.jit
 def jacobi_kernel(u, unew, nx, ny, dx2, dy2, inv_denom):
     """
-    Numba CUDA Jacobi update.
-    The kernel assumes contiguous row-major arrays.
-    Updates only:
-        unew[i0:i1, 1:nx-1]
-    where i0 and i1 are local row bounds.
+    Perform one Jacobi update over the physical interior.
+
+    The kernel assumes contiguous row-major arrays and updates:
+
+        unew[1:ny-1, 1:nx-1]
     """
     j, i = cuda.grid(2)
     j += 1
@@ -117,15 +127,33 @@ class Laplace2DNumbaCUDA:
         self.bc_right = float(bc_right)
         self.bc_bottom = float(bc_bottom)
         self.bc_top = float(bc_top)
-        h_u = np.zeros((self.ny, self.nx), dtype=np.float64)
-        h_unew = np.zeros_like(h_u)
-        self._apply_dirichlet_bc_host(h_u)
-        self._apply_dirichlet_bc_host(h_unew)
-        self.d_u = cuda.to_device(h_u)
-        self.d_unew = cuda.to_device(h_unew)
-        n_interior = (self.ny - 2) * (self.nx - 2)
-        self.d_diff_sq = cuda.device_array(n_interior, dtype=np.float64)
-        self.d_norm_sq = cuda.device_array(n_interior, dtype=np.float64)
+        self.h_initial = np.zeros((self.ny, self.nx), dtype=np.float64,)
+        self._apply_dirichlet_bc_host(self.h_initial)
+        self.d_u = cuda.to_device(self.h_initial)
+        self.d_unew = cuda.to_device(self.h_initial)
+        self.jacobi_threads = (TPB_X, TPB_Y)
+        self.jacobi_blocks = (
+            (self.nx - 2 + self.jacobi_threads[0] - 1) // self.jacobi_threads[0],
+            (self.ny - 2 + self.jacobi_threads[1] - 1) // self.jacobi_threads[1],
+        )
+        self.n_interior = ((self.ny - 2) * (self.nx - 2))
+        self.norm_blocks = (self.n_interior + REDUCE_TPB - 1) // REDUCE_TPB
+        self._validate_kernel_configuration()
+        self.d_diff_sq = cuda.device_array(self.n_interior, dtype=np.float64)
+        self.d_norm_sq = cuda.device_array(self.n_interior, dtype=np.float64)
+
+    def _validate_kernel_configuration(self):
+        device = cuda.get_current_device()
+        jacobi_threads_per_block = TPB_X * TPB_Y
+        if jacobi_threads_per_block > device.MAX_THREADS_PER_BLOCK:
+            raise ValueError(f"Jacobi block requires {jacobi_threads_per_block} threads. "
+                             f"But the device supports only {device.MAX_THREADS_PER_BLOCK}")
+        if TPB_X > device.MAX_BLOCK_DIM_X:
+            raise ValueError(f"TPB_X={TPB_X} exceeds MAX_BLOCK_DIM_X={device.MAX_BLOCK_DIM_X}")
+        if TPB_Y > device.MAX_BLOCK_DIM_Y:
+            raise ValueError(f"TPB_Y={TPB_Y} exceeds MAX_BLOCK_DIM_Y={device.MAX_BLOCK_DIM_Y}")
+        if REDUCE_TPB > device.MAX_THREADS_PER_BLOCK:
+            raise ValueError(f"REDUCE_TPB={REDUCE_TPB} exceeds MAX_THREADS_PER_BLOCK={device.MAX_THREADS_PER_BLOCK}")
 
     @staticmethod
     def _validate_problem_parameters(nx, ny, lx, ly, bc_left, bc_right, bc_bottom, bc_top):
@@ -148,12 +176,18 @@ class Laplace2DNumbaCUDA:
             raise ValueError("lx and ly must be positive")
 
     @staticmethod
-    def _validate_run_parameters(max_iters, tol, check_every, fixed_iters):
-        if not isinstance(max_iters, int):
+    def _validate_run_parameters(
+        max_iters,
+        tol,
+        check_every,
+        fixed_iters,
+    ):
+        integer_types = (int, np.integer)
+        if not isinstance(max_iters, integer_types):
             raise TypeError("max_iters must be an integer")
-        if not isinstance(check_every, int):
+        if not isinstance(check_every, integer_types):
             raise TypeError("check_every must be an integer")
-        if fixed_iters is not None and not isinstance(fixed_iters, int):
+        if fixed_iters is not None and not isinstance(fixed_iters, integer_types):
             raise TypeError("fixed_iters must be an integer")
         if max_iters < 1:
             raise ValueError("max_iters must be at least 1")
@@ -185,14 +219,9 @@ class Laplace2DNumbaCUDA:
         """
         Reset device solution arrays to the initial condition.
         """
-        h_u = np.zeros((self.ny, self.nx), dtype=np.float64)
-        h_unew = np.zeros_like(h_u)
-        self._apply_dirichlet_bc_host(h_u)
-        self._apply_dirichlet_bc_host(h_unew)
-        self.d_u.copy_to_device(h_u)
-        self.d_unew.copy_to_device(h_unew)
+        self.d_u.copy_to_device(self.h_initial)
+        self.d_unew.copy_to_device(self.h_initial)
         cuda.synchronize()
-
 
     # Compute kernel
     def jacobi_step(self):
@@ -204,9 +233,7 @@ class Laplace2DNumbaCUDA:
         overwritten because the kernel updates only interior points.
         """
         with nvtx_range("jacobi_step", id_color=2):
-            threads = (TPB_X, TPB_Y)
-            blocks = ((self.nx - 2 + threads[0] - 1) // threads[0], (self.ny - 2 + threads[1] - 1) // threads[1],)
-            jacobi_kernel[blocks, threads](
+            jacobi_kernel[self.jacobi_blocks, self.jacobi_threads](
                 self.d_u, self.d_unew, self.nx, self.ny, self.dx2, self.dy2, self.inv_denom,
             )
 
@@ -217,11 +244,8 @@ class Laplace2DNumbaCUDA:
             ||u_new - u||_2 / ||u_new||_2
         over true global interior points only.
         """
-        rel_update_norm = 0.0
         with nvtx_range("jacobi_l2", id_color=3):
-            n = (self.ny - 2) * (self.nx - 2)
-            blocks = (n + REDUCE_TPB - 1) // REDUCE_TPB
-            rel_update_norm_map_kernel[blocks, REDUCE_TPB](
+            rel_update_norm_map_kernel[self.norm_blocks, REDUCE_TPB](
                 self.d_u,
                 self.d_unew,
                 self.nx,
@@ -229,10 +253,10 @@ class Laplace2DNumbaCUDA:
                 self.d_diff_sq,
                 self.d_norm_sq,
             )
-            diff2 = sum_reduce(self.d_diff_sq, size=n)
-            norm2 = sum_reduce(self.d_norm_sq, size=n)
+            diff2 = sum_reduce(self.d_diff_sq, size=self.n_interior)
+            norm2 = sum_reduce(self.d_norm_sq, size=self.n_interior)
             rel_update_norm = np.sqrt(diff2) / max(np.sqrt(norm2), 1.0e-300)
-        return float(rel_update_norm) 
+            return float(rel_update_norm) 
 
 
     def warmup(self):
@@ -250,29 +274,30 @@ class Laplace2DNumbaCUDA:
     def run(self, max_iters, tol, check_every, fixed_iters=None):
         rel_update_norm = float("inf")
         niters = 0
-        elapsed = 0.0
         with nvtx_range("jacobi_run", id_color=5):
-            Laplace2DNumbaCUDA._validate_run_parameters(max_iters, tol, check_every, fixed_iters)
-            nstop = fixed_iters if fixed_iters is not None else max_iters
+            self._validate_run_parameters(max_iters, tol, check_every, fixed_iters)
+            iteration_limit = fixed_iters if fixed_iters is not None else max_iters
             start = cuda.event()
             stop = cuda.event()
             cuda.synchronize()
+            wall_t0 = perf_counter()
             start.record()
-            for it in range(1, nstop + 1):
+            for it in range(1, iteration_limit + 1):
                 self.jacobi_step()
-                do_check = (it == 1 or it % check_every == 0 or it == nstop)
+                do_check = (it == 1 or it % check_every == 0 or it == iteration_limit)
+                converged = False
                 if do_check:
                     rel_update_norm = self.compute_relative_l2_update_norm()
-                    if fixed_iters is None and rel_update_norm < tol:
-                        self.d_u, self.d_unew = self.d_unew, self.d_u
-                        niters = it
-                        break
+                    converged = (fixed_iters is None and rel_update_norm < tol)
                 self.d_u, self.d_unew = self.d_unew, self.d_u
                 niters = it
+                if converged:
+                    break
             stop.record()
             stop.synchronize()
-            elapsed = cuda.event_elapsed_time(start, stop) / 1000.0
-        return niters, rel_update_norm, elapsed
+            elapsed_cuda_event = cuda.event_elapsed_time(start, stop) / 1000.0
+            elapsed_wall = perf_counter() - wall_t0
+        return niters, rel_update_norm, elapsed_cuda_event, elapsed_wall
 
     # Output
     def write_hdf5(self, filename, niters, rel_update_norm):
@@ -282,7 +307,6 @@ class Laplace2DNumbaCUDA:
         """
         with nvtx_range("jacobi_write", id_color=6):
             import h5py
-            cuda.synchronize()
             host_u = self.d_u.copy_to_host()
             with h5py.File(filename, "w") as f:
                 dset = f.create_dataset("u", data=host_u)
@@ -366,23 +390,27 @@ def main():
         if isinstance(device.name, bytes)
         else str(device.name)
     )
-    bytes_per_array = args.ny * args.nx * np.dtype(np.float64).itemsize
+    field_bytes = (args.ny * args.nx * np.dtype(np.float64).itemsize)
+    interior_bytes = ((args.ny - 2) * (args.nx - 2) * np.dtype(np.float64).itemsize)
+    total_device_bytes = (2 * field_bytes + 2 * interior_bytes)
+
     print("Serial Numba CUDA Laplace solver")
-    print(f"  CUDA device       : {args.device}")
-    print(f"  grid              : ny={args.ny}, nx={args.nx}")
-    print(f"  physical size     : ly={args.ly}, lx={args.lx}")
-    print(f"  check every       : {args.check_every}")
-    print(f"  GPU device name   : {gpu_name}")
-    print(f"  memory per field  : {bytes_per_array / 1024**2:.2f} MiB")
-    print(f"  memory total      : {2 * bytes_per_array / 1024**2:.2f} MiB")
-    print(f"  output            : {args.output}")
+    print(f"  GPU device id         : {args.device}")
+    print(f"  grid                  : ny={args.ny}, nx={args.nx}")
+    print(f"  physical size         : ly={args.ly}, lx={args.lx}")
+    print(f"  check every           : {args.check_every}")
+    print(f"  GPU device name       : {gpu_name}")
+    print(f"  memory per field      : {field_bytes / 1024**2:.2f} MiB")
+    print(f"  norm workspace        : {2 * interior_bytes / 1024**2:.2f} MiB")
+    print(f"  explicit device total : {total_device_bytes / 1024**2:.2f} MiB")
+    print(f"  output                : {args.output}")
     if args.fixed_iters is not None:
-        print(f"  mode              : fixed iteration")
-        print(f"  fixed iterations  : {args.fixed_iters}")
+        print(f"  mode                  : fixed iteration")
+        print(f"  fixed iterations      : {args.fixed_iters}")
     else:
-        print(f"  mode              : tolerance")
-        print(f"  tolerance         : {args.tol}")
-        print(f"  max iterations    : {args.max_iters}")
+        print(f"  mode                  : tolerance")
+        print(f"  tolerance             : {args.tol}")
+        print(f"  max iterations        : {args.max_iters}")
     print("", flush=True)
     solver = Laplace2DNumbaCUDA(
         nx=args.nx,
@@ -399,24 +427,37 @@ def main():
     solver.warmup()
     print("Warm-up complete.", flush=True)
 
-    niters, rel_update_norm, elapsed = solver.run(
+    niters, rel_update_norm, elapsed_cuda_event, elapsed_wall = solver.run(
         max_iters=args.max_iters,
         tol=args.tol,
         check_every=args.check_every,
         fixed_iters=args.fixed_iters,
     )
-
-    global_updates_per_iter = (args.nx - 2) * (args.ny - 2)
-    gupdates_per_second = (global_updates_per_iter * niters / elapsed / 1.0e9 )
-
-    print(f"Numba iterations                     : {niters}")
-    print(f"Numba final relative update norm     : {rel_update_norm:.6e}")
-    print(f"Numba elapsed time [s]               : {elapsed:.6f}")
-    print(f"Numba time per iter [ms]             : {1000.0 * elapsed / max(niters, 1):.6f}")
-    print(f"Numba Jacobi throughput [GUpdates/s] : {gupdates_per_second:.6f}")
+    
+    converged = (args.fixed_iters is None and rel_update_norm < args.tol)
+    global_updates_per_iter = ((args.nx - 2) * (args.ny - 2))
+    total_updates = global_updates_per_iter * niters
+    gupdates_per_second_cuda_event = (total_updates / elapsed_cuda_event / 1.0e9 if elapsed_cuda_event > 0.0 else float("inf"))
+    gupdates_per_second_wall       = (total_updates / elapsed_wall       / 1.0e9 if elapsed_wall       > 0.0 else float("inf"))
+    print()
+    print("============================================================")
+    print("Solver summary")
+    print("============================================================")
+    print(f"Numba CUDA iterations                         : {niters}")
+    if args.fixed_iters is None:
+        print(f"Numba CUDA converged                          : {converged}")
+    else:
+        print("Numba CUDA convergence used for stopping      : no")
+    print(f"Numba CUDA final relative update norm         : {rel_update_norm:.6e}")
+    print(f"Numba CUDA-event solver interval [s]          : {elapsed_cuda_event:.6f}")
+    print(f"Numba CUDA wall elapsed time [s]              : {elapsed_wall:.6f}")
+    print(f"Numba CUDA-event time per iter [ms]           : {1000.0 * elapsed_cuda_event / max(niters, 1):.6f}")
+    print(f"Numba CUDA wall time per iter [ms]            : {1000.0 * elapsed_wall / max(niters, 1):.6f}")
+    print(f"Numba CUDA-event throughput [GUpdates/s]      : {gupdates_per_second_cuda_event:.6f}")
+    print(f"Numba CUDA wall throughput [GUpdates/s]       : {gupdates_per_second_wall:.6f}")
     if args.output is not None:
         solver.write_hdf5(args.output, niters, rel_update_norm)
-        print(f"Numba wrote solution                 : {args.output}")
+        print(f"Numba CUDA wrote solution                     : {args.output}")
     print("", flush=True)
 
 

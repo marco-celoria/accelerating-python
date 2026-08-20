@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
+from contextlib import contextmanager
+from time import perf_counter
+
 import cupy as cp
 import numpy as np
-from contextlib import contextmanager
 
 @contextmanager
 def nvtx_range(name: str, id_color: int = -1):
@@ -144,13 +146,27 @@ class Laplace2DCuPyRawKernel:
         self.unew = cp.zeros_like(self.u)
         self._apply_dirichlet_bc(self.u)
         self._apply_dirichlet_bc(self.unew)
-        n_interior = (self.ny - 2) * (self.nx - 2)
+        self.n_interior = (self.ny - 2) * (self.nx - 2)
         self.rel_update_norm_threads = 256
         if self.rel_update_norm_threads & (self.rel_update_norm_threads - 1) != 0:
             raise ValueError("rel_update_norm_threads must be a power of two")
-        self.rel_update_norm_blocks = min(4096, (n_interior + self.rel_update_norm_threads - 1) // self.rel_update_norm_threads,)
+        self.rel_update_norm_blocks = min(4096, (self.n_interior + self.rel_update_norm_threads - 1) // self.rel_update_norm_threads,)
+        self.rel_update_norm_shared_bytes = (2 * self.rel_update_norm_threads * cp.dtype(cp.float64).itemsize)
+        self.jacobi_threads = (32, 8)
+        self.jacobi_blocks = (
+            (self.nx - 2 + self.jacobi_threads[0] - 1) // self.jacobi_threads[0],
+            (self.ny - 2 + self.jacobi_threads[1] - 1) // self.jacobi_threads[1],
+        )
+        self._validate_kernel_configuration()
+        self.nx_kernel = np.uint64(self.nx)
+        self.ny_kernel = np.uint64(self.ny)
+        self.n_interior_kernel = np.uint64(self.n_interior)
+        self.dx2_kernel = np.float64(self.dx2)
+        self.dy2_kernel = np.float64(self.dy2)
+        self.inv_denom_kernel = np.float64(self.inv_denom)
         self.partial_diff = cp.empty(self.rel_update_norm_blocks, dtype=cp.float64)
         self.partial_norm = cp.empty(self.rel_update_norm_blocks, dtype=cp.float64)
+
 
     @staticmethod
     def _validate_problem_parameters(nx, ny, lx, ly, bc_left, bc_right, bc_bottom, bc_top, dtype):
@@ -176,11 +192,12 @@ class Laplace2DCuPyRawKernel:
 
     @staticmethod
     def _validate_run_parameters(max_iters, tol, check_every, fixed_iters):
-        if not isinstance(max_iters, int):
+        integer_types = (int, np.integer)
+        if not isinstance(max_iters, integer_types):
             raise TypeError("max_iters must be an integer")
-        if not isinstance(check_every, int):
+        if not isinstance(check_every, integer_types):
             raise TypeError("check_every must be an integer")
-        if fixed_iters is not None and not isinstance(fixed_iters, int):
+        if (fixed_iters is not None and not isinstance(fixed_iters, integer_types)):
             raise TypeError("fixed_iters must be an integer")
         if max_iters < 1:
             raise ValueError("max_iters must be at least 1")
@@ -192,6 +209,26 @@ class Laplace2DCuPyRawKernel:
             if not np.isfinite(float(tol)) or float(tol) <= 0.0:
                 raise ValueError("tol must be finite and positive unless fixed_iters is used")
 
+    def _validate_kernel_configuration(self):
+        attributes = cp.cuda.Device().attributes
+        jacobi_threads_per_block = (self.jacobi_threads[0] * self.jacobi_threads[1])
+        if jacobi_threads_per_block > attributes["MaxThreadsPerBlock"]:
+            raise ValueError(f"Jacobi block requires {jacobi_threads_per_block} threads. "
+                             f"But the device supports only {attributes['MaxThreadsPerBlock']}")
+
+        if self.jacobi_threads[0] > attributes["MaxBlockDimX"]:
+            raise ValueError(f"Jacobi block X dimension {self.jacobi_threads[0]} exceeds MaxBlockDimX={attributes['MaxBlockDimX']}")
+
+        if self.jacobi_threads[1] > attributes["MaxBlockDimY"]:
+            raise ValueError(f"Jacobi block Y dimension {self.jacobi_threads[1]} exceeds MaxBlockDimY={attributes['MaxBlockDimY']}")
+
+        if self.rel_update_norm_threads > attributes["MaxThreadsPerBlock"]:
+            raise ValueError(f"Reduction block requires {self.rel_update_norm_threads} threads. "
+                             f"But the device supports only {attributes['MaxThreadsPerBlock']}")
+        
+        if self.rel_update_norm_shared_bytes > attributes["MaxSharedMemoryPerBlock"]:
+            raise ValueError(f"Reduction kernel requires {self.rel_update_norm_shared_bytes} bytes of shared memory per block. " 
+                             f"But the device supports only {attributes['MaxSharedMemoryPerBlock']} bytes")
 
     # Boundary conditions
     def _apply_dirichlet_bc(self, arr):
@@ -241,55 +278,50 @@ class Laplace2DCuPyRawKernel:
         because the kernel updates only interior points.
         """
         with nvtx_range("jacobi_step"):
-            threads = (32, 8)
-            blocks = ((self.nx - 2 + threads[0] - 1) // threads[0], (self.ny - 2 + threads[1] - 1) // threads[1],)
-            jacobi_kernel(blocks, threads,
-                (self.u, self.unew, np.uint64(self.nx), np.uint64(self.ny), self.dx2, self.dy2, self.inv_denom,),
+            jacobi_kernel(self.jacobi_blocks, self.jacobi_threads,
+                (self.u, self.unew, self.nx_kernel, self.ny_kernel, self.dx2_kernel, self.dy2_kernel, self.inv_denom_kernel,),
             )
 
     # Relative update norm
     def compute_relative_l2_update_norm(self):
-        rel_update_norm = 0.0
         with nvtx_range("compute_relative_l2_update_norm"):
-            n = (self.ny - 2) * (self.nx - 2)
-            shared_mem_bytes = 2 * self.rel_update_norm_threads * cp.dtype(cp.float64).itemsize
             rel_update_norm_partial_kernel((self.rel_update_norm_blocks,), (self.rel_update_norm_threads,),
-                (self.u, self.unew, self.partial_diff, self.partial_norm, np.uint64(self.nx), np.uint64(n)),
-                shared_mem=shared_mem_bytes,
+                (self.u, self.unew, self.partial_diff, self.partial_norm, self.nx_kernel, self.n_interior_kernel),
+                shared_mem=self.rel_update_norm_shared_bytes,
             )
             diff2 = cp.sum(self.partial_diff)
             norm2 = cp.sum(self.partial_norm)
             rel_update_norm_gpu = cp.sqrt(diff2) / cp.maximum(cp.sqrt(norm2), 1.0e-300)
-            rel_update_norm = rel_update_norm_gpu.get()
-        return float(rel_update_norm)
+            return float(rel_update_norm_gpu.get())
 
     # Solver loop
     def run(self, max_iters, tol, check_every, fixed_iters=None):
         rel_update_norm = float("inf")
         niters = 0
-        elapsed = 0.0
         with nvtx_range("run"):
-            Laplace2DCuPyRawKernel._validate_run_parameters(max_iters, tol, check_every, fixed_iters)
-            nstop = fixed_iters if fixed_iters is not None else max_iters
+            self._validate_run_parameters(max_iters, tol, check_every, fixed_iters)
+            iteration_limit = fixed_iters if fixed_iters is not None else max_iters
             start = cp.cuda.Event()
             stop = cp.cuda.Event()
             cp.cuda.get_current_stream().synchronize()
+            wall_t0 = perf_counter()
             start.record()
-            for it in range(1, nstop + 1):
+            for it in range(1, iteration_limit + 1):
                 self.jacobi_step()
-                do_check = (it == 1 or it % check_every == 0 or it == nstop)
+                do_check = (it == 1 or it % check_every == 0 or it == iteration_limit)
+                converged = False
                 if do_check:
                     rel_update_norm = self.compute_relative_l2_update_norm()
-                    if fixed_iters is None and rel_update_norm < tol:
-                        self.u, self.unew = self.unew, self.u
-                        niters = it
-                        break
+                    converged = (fixed_iters is None and rel_update_norm < tol)
                 self.u, self.unew = self.unew, self.u
                 niters = it
+                if converged:
+                    break
             stop.record()
             stop.synchronize()
-            elapsed = cp.cuda.get_elapsed_time(start, stop) / 1000.0
-        return niters, rel_update_norm, elapsed
+            elapsed_cuda_event = cp.cuda.get_elapsed_time(start, stop) / 1000.0
+            elapsed_wall = perf_counter() - wall_t0
+        return niters, rel_update_norm, elapsed_cuda_event, elapsed_wall
 
     # Output
     def write_hdf5(self, filename, niters, rel_update_norm):
@@ -299,7 +331,6 @@ class Laplace2DCuPyRawKernel:
         """
         with nvtx_range("write_hdf5"):
             import h5py
-            cp.cuda.get_current_stream().synchronize()
             host_u = cp.asnumpy(self.u)
             with h5py.File(filename, "w") as f:
                 dset = f.create_dataset("u", data=host_u)
@@ -414,25 +445,37 @@ def main():
     solver.warmup()
     print("Warm-up complete.", flush=True)
 
-    niters, rel_update_norm, elapsed = solver.run(
+    niters, rel_update_norm, elapsed_cuda_event, elapsed_wall = solver.run(
         max_iters=args.max_iters,
         tol=args.tol,
         check_every=args.check_every,
         fixed_iters=args.fixed_iters,
     )
     
-    global_updates_per_iter = (args.nx - 2) * (args.ny - 2)
-    gupdates_per_second = (global_updates_per_iter * niters / elapsed / 1.0e9 )
-
-    print(f"RawCuPy iterations                     : {niters}")
-    print(f"RawCuPy final relative update norm     : {rel_update_norm:.6e}")
-    print(f"RawCuPy elapsed time [s]               : {elapsed:.6f}")
-    print(f"RawCuPy time per iter [ms]             : {1000.0 * elapsed / max(niters, 1):.6f}")
-    print(f"RawCuPy Jacobi throughput [GUpdates/s] : {gupdates_per_second:.6f}")
-
+    global_updates_per_iter = ((args.nx - 2) * (args.ny - 2))
+    total_updates = global_updates_per_iter * niters
+    gupdates_per_second_cuda_event = (total_updates / elapsed_cuda_event / 1.0e9 if elapsed_cuda_event > 0.0 else float("inf"))
+    gupdates_per_second_wall       = (total_updates / elapsed_wall       / 1.0e9 if elapsed_wall       > 0.0 else float("inf"))
+    converged = (args.fixed_iters is None and rel_update_norm < args.tol)
+    print()
+    print("============================================================")
+    print("Solver summary")
+    print("============================================================")
+    print(f"CuPy RawKernel iterations                         : {niters}")
+    if args.fixed_iters is None:
+        print(f"CuPy RawKernel converged                          : {converged}")
+    else:
+        print("CuPy RawKernel convergence used for stopping      : no")
+    print(f"CuPy RawKernel final relative update norm         : {rel_update_norm:.6e}")
+    print(f"CuPy RawKernel CUDA-event solver interval [s]     : {elapsed_cuda_event:.6f}")
+    print(f"CuPy RawKernel wall elapsed time [s]              : {elapsed_wall:.6f}")
+    print(f"CuPy RawKernel CUDA-event time per iter [ms]      : {1000.0 * elapsed_cuda_event / max(niters, 1):.6f}")
+    print(f"CuPy RawKernel wall time per iter [ms]            : {1000.0 * elapsed_wall / max(niters, 1):.6f}")
+    print(f"CuPy RawKernel CUDA-event throughput [GUpdates/s] : {gupdates_per_second_cuda_event:.6f}")
+    print(f"CuPy RawKernel wall throughput [GUpdates/s]       : {gupdates_per_second_wall:.6f}")
     if args.output is not None:
         solver.write_hdf5(args.output, niters, rel_update_norm)
-        print(f"RawCuPy wrote solution                 : {args.output}")
+        print(f"CuPy RawKernel wrote solution                     : {args.output}")
     print("", flush=True)
 
 

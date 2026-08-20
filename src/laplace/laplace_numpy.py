@@ -2,7 +2,7 @@
 
 import argparse
 import numpy as np
-import time
+from time import perf_counter
 
 class Laplace2DNumPy:
     """
@@ -24,7 +24,7 @@ class Laplace2DNumPy:
         bc_bottom=0.0,
         bc_top=0.0,
     ):
-        Laplace2DNumPy._validate_problem_parameters(nx, ny, lx, ly, bc_left, bc_right, bc_bottom, bc_top)
+        self._validate_problem_parameters(nx, ny, lx, ly, bc_left, bc_right, bc_bottom, bc_top)
         self.nx = int(nx)
         self.ny = int(ny)
         self.lx = float(lx)
@@ -65,11 +65,12 @@ class Laplace2DNumPy:
 
     @staticmethod
     def _validate_run_parameters(max_iters, tol, check_every, fixed_iters):
-        if not isinstance(max_iters, int):
+        integer_types = (int, np.integer)
+        if not isinstance(max_iters, integer_types):
             raise TypeError("max_iters must be an integer")
-        if not isinstance(check_every, int):
+        if not isinstance(check_every, integer_types):
             raise TypeError("check_every must be an integer")
-        if fixed_iters is not None and not isinstance(fixed_iters, int):
+        if (fixed_iters is not None and not isinstance(fixed_iters, integer_types)):
             raise TypeError("fixed_iters must be an integer")
         if max_iters < 1:
             raise ValueError("max_iters must be at least 1")
@@ -85,7 +86,11 @@ class Laplace2DNumPy:
 
     # Boundary conditions
     def _apply_dirichlet_bc(self, arr):
-        # match ordering of distributed version
+        """
+        Apply Dirichlet boundary conditions.
+        Top and bottom conditions are applied last and therefore
+        determine the values at the four corners.
+        """
         arr[ :,  0] = self.bc_left
         arr[ :, -1] = self.bc_right
         arr[ 0,  :] = self.bc_bottom
@@ -109,11 +114,9 @@ class Laplace2DNumPy:
                   (self.u[1:-1, :-2] + self.u[1:-1, 2:]) * self.dy2 
                 + (self.u[:-2, 1:-1] + self.u[2:, 1:-1]) * self.dx2
                 ) * self.inv_denom
-        # Boundaries are initialized once in both u and unew.
-        # Since this update only writes: self.unew[1:-1, 1:-1]
-        # the boundary entries of unew remain unchanged after initialization. 
-        # Since jacobi_step writes only interior points, boundaries remain valid across ping-pong swaps.
-        #self._apply_dirichlet_bc(self.unew) <- Not needed because only interior points are overwritten.
+        # Both arrays are initialized with identical Dirichlet boundaries.
+        # Only interior values are updated, so boundaries remain valid
+        # throughout the ping-pong swaps.
 
     # Relative update norm
     def compute_relative_l2_update_norm(self):
@@ -126,28 +129,27 @@ class Laplace2DNumPy:
 
     # Solver loop
     def run(self, max_iters, tol, check_every, fixed_iters=None):
-        Laplace2DNumPy._validate_run_parameters(max_iters, tol, check_every, fixed_iters)
+        self._validate_run_parameters(max_iters, tol, check_every, fixed_iters)
         rel_update_norm = np.inf
         niters = 0
-        nstop = fixed_iters if fixed_iters is not None else max_iters
-        t0 = time.perf_counter()
-        for it in range(1, nstop + 1):
+        iteration_limit = fixed_iters if fixed_iters is not None else max_iters
+        t0 = perf_counter()
+        for it in range(1, iteration_limit + 1):
             self.jacobi_step()
             do_check = (
                 it == 1 or
                 it % check_every == 0 or
-                it == nstop
+                it == iteration_limit
             )
+            converged = False
             if do_check:
                 rel_update_norm = self.compute_relative_l2_update_norm()
-                if fixed_iters is None and rel_update_norm < tol:
-                    self.u, self.unew = self.unew, self.u
-                    niters = it
-                    break
+                converged = (fixed_iters is None and rel_update_norm < tol)
             self.u, self.unew = self.unew, self.u
             niters = it
-        t1 = time.perf_counter()
-        elapsed = t1 - t0
+            if converged:
+                break
+        elapsed = perf_counter() - t0
         return niters, rel_update_norm, elapsed
 
     # Output
@@ -247,21 +249,37 @@ def main():
         bc_bottom=args.bc_bottom,
         bc_top=args.bc_top,
     )
+    
+    print("Warming up NumPy Jacobi operations...")
+    solver.jacobi_step()
+    solver.compute_relative_l2_update_norm()
+    solver.reset_fields()
+    print("Warmup complete.")
+    print("Timed run starts from the initial condition.")
+
     niters, rel_update_norm, elapsed = solver.run(
         max_iters=args.max_iters,
         tol=args.tol,
         check_every=args.check_every,
         fixed_iters=args.fixed_iters,
     )
-    
+   
+    converged = (args.fixed_iters is None and rel_update_norm < args.tol)
     global_updates_per_iter = (args.nx - 2) * (args.ny - 2)
-    gupdates_per_second = (global_updates_per_iter * niters / elapsed / 1.0e9 )
-
+    gupdates_per_second = (global_updates_per_iter * niters / elapsed / 1.0e9 if elapsed > 0.0 else float("inf"))
+    print()
+    print("============================================================")
+    print("Solver summary")
+    print("============================================================")
     print(f"NumPy iterations                     : {niters}")
+    if args.fixed_iters is None:
+        print(f"NumPy converged                      : {converged}")
+    else:
+        print("NumPy converged                      : not evaluated in fixed-iteration mode")
     print(f"NumPy final relative update norm     : {rel_update_norm:.6e}")
-    print(f"NumPy elapsed time[s]                : {elapsed:.6f}")
+    print(f"NumPy elapsed time [s]               : {elapsed:.6f}")
     print(f"NumPy time per iter [ms]             : {1000.0 * elapsed / max(niters, 1):.6f}")
-    print(f"Numpy Jacobi throughput [GUpdates/s] : {gupdates_per_second:.6f}")
+    print(f"NumPy Jacobi throughput [GUpdates/s] : {gupdates_per_second:.6f}")
     if args.output is not None:
         solver.write_hdf5(args.output, niters, rel_update_norm)
         print(f"NumPy wrote solution                 : {args.output}")

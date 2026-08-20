@@ -274,46 +274,63 @@ class Laplace2DDistributedNCCL:
         self.u_ready_event = cp.cuda.Event(disable_timing=True)
         self.halos_ready_event = cp.cuda.Event(disable_timing=True)
 
+        self.update_i0, self.update_i1 = (self._owned_update_row_bounds())
+        self.local_update_count = (max(0, self.update_i1 - self.update_i0) * (self.nx - 2))
+        self.jacobi_threads = (32, 8)
+        self.rel_update_norm_threads = 256
+        if (self.rel_update_norm_threads & (self.rel_update_norm_threads - 1)) != 0:
+            raise ValueError("rel_update_norm_threads must be a power of two")
+        if self.local_update_count > 0:
+            self.rel_update_norm_blocks = min(4096, (self.local_update_count + self.rel_update_norm_threads - 1) // self.rel_update_norm_threads,)
+        else:
+            self.rel_update_norm_blocks = 1
+
+        self.rel_update_norm_shared_bytes = (2 * self.rel_update_norm_threads * cp.dtype(cp.float64).itemsize)
+
+        self.nx_kernel = np.uint64(self.nx)
+        self.update_i0_kernel = np.uint64(self.update_i0)
+        self.update_i1_kernel = np.uint64(self.update_i1)
+        self.local_update_count_kernel = np.uint64(self.local_update_count)
+        self.dx2_kernel = np.float64(self.dx2)
+        self.dy2_kernel = np.float64(self.dy2)
+        self.inv_denom_kernel = np.float64(self.inv_denom)
+        self.upper_interface = (self.update_i0 if self.up is not None else None)
+        self.lower_interface = (self.update_i1 - 1 if self.down is not None else None)
+        self.deep_i0 = (self.update_i0 + int(self.up is not None))
+        self.deep_i1 = (self.update_i1 - int(self.down is not None))
+        self._validate_kernel_configuration()
+
         # Allocate and initialize on the compute stream. The recorded event
         # makes this initialization visible to the communication stream.
         with self.compute_stream:
-            self.u = cp.zeros(
-                (self.local_ny + 2, self.nx), dtype=self.dtype
-            )
+            self.u = cp.zeros((self.local_ny + 2, self.nx), dtype=self.dtype,)
             self.unew = cp.zeros_like(self.u)
             self._apply_dirichlet_bc(self.u)
             self._apply_dirichlet_bc(self.unew)
-
-            self.red_local = cp.zeros(2, dtype=cp.float64)
-            self.red_global = cp.zeros(2, dtype=cp.float64)
-
-            self.rel_update_norm_threads = 256
-            if (
-                self.rel_update_norm_threads
-                & (self.rel_update_norm_threads - 1)
-            ) != 0:
-                raise ValueError(
-                    "rel_update_norm_threads must be a power of two"
-                )
-
-            max_local_interior = self.local_ny * (self.nx - 2)
-            self.rel_update_norm_blocks = min(
-                4096,
-                (
-                    max_local_interior
-                    + self.rel_update_norm_threads
-                    - 1
-                )
-                // self.rel_update_norm_threads,
-            )
-            self.partial_diff = cp.empty(
-                self.rel_update_norm_blocks, dtype=cp.float64
-            )
-            self.partial_norm = cp.empty(
-                self.rel_update_norm_blocks, dtype=cp.float64
-            )
-
+            self.red_local  = cp.zeros(2, dtype=cp.float64,)
+            self.red_global = cp.zeros(2, dtype=cp.float64,)
+            self.partial_diff = cp.empty(self.rel_update_norm_blocks, dtype=cp.float64,)
+            self.partial_norm = cp.empty(self.rel_update_norm_blocks, dtype=cp.float64,)
             self.u_ready_event.record(self.compute_stream)
+
+
+    def _validate_kernel_configuration(self):
+        attributes = cp.cuda.Device().attributes
+        jacobi_threads_per_block = (self.jacobi_threads[0] * self.jacobi_threads[1])
+        if jacobi_threads_per_block > attributes["MaxThreadsPerBlock"]:
+            raise ValueError(f"Jacobi block requires {jacobi_threads_per_block} threads. "
+                             f"But the device supports only {attributes['MaxThreadsPerBlock']}")
+        if self.jacobi_threads[0] > attributes["MaxBlockDimX"]:
+            raise ValueError(f"Jacobi block X dimension {self.jacobi_threads[0]} exceeds MaxBlockDimX={attributes['MaxBlockDimX']}")
+        if self.jacobi_threads[1] > attributes["MaxBlockDimY"]:
+            raise ValueError(f"Jacobi block Y dimension {self.jacobi_threads[1]} exceeds MaxBlockDimY={attributes['MaxBlockDimY']}")
+        if self.rel_update_norm_threads > attributes["MaxThreadsPerBlock"]:
+            raise ValueError(f"Reduction block requires {self.rel_update_norm_threads} threads. "
+                             f"But the device supports only {attributes['MaxThreadsPerBlock']}")
+        if self.rel_update_norm_shared_bytes > attributes["MaxSharedMemoryPerBlock"]:
+            raise ValueError(f"Reduction requires {self.rel_update_norm_shared_bytes} bytes of shared memory. "
+                             f"But the device supports only {attributes['MaxSharedMemoryPerBlock']} bytes")
+
 
     @staticmethod
     def _validate_problem_parameters(
@@ -349,29 +366,31 @@ class Laplace2DDistributedNCCL:
         if float(lx) <= 0.0 or float(ly) <= 0.0:
             raise ValueError("lx and ly must be positive")
         if dtype != cp.float64:
-            raise ValueError(
-                "This RawKernel implementation currently supports only cp.float64"
-            )
+            raise ValueError("This RawKernel implementation currently supports only cp.float64")
 
     @staticmethod
-    def _validate_run_parameters(max_iters, tol, check_every, fixed_iters):
-        if not isinstance(max_iters, int):
+    def _validate_run_parameters(
+        max_iters,
+        tol,
+        check_every,
+        fixed_iters,
+    ):
+        integer_types = (int, np.integer)
+        if not isinstance(max_iters, integer_types):
             raise TypeError("max_iters must be an integer")
-        if not isinstance(check_every, int):
+        if not isinstance(check_every, integer_types):
             raise TypeError("check_every must be an integer")
-        if fixed_iters is not None and not isinstance(fixed_iters, int):
+        if (fixed_iters is not None and not isinstance(fixed_iters, integer_types,)):
             raise TypeError("fixed_iters must be an integer")
         if max_iters < 1:
             raise ValueError("max_iters must be at least 1")
         if check_every < 1:
             raise ValueError("check_every must be at least 1")
-        if fixed_iters is not None and fixed_iters < 1:
+        if (fixed_iters is not None and fixed_iters < 1):
             raise ValueError("fixed_iters must be at least 1")
         if fixed_iters is None:
-            if not np.isfinite(float(tol)) or float(tol) <= 0.0:
-                raise ValueError(
-                    "tol must be finite and positive unless fixed_iters is used"
-                )
+            if (not np.isfinite(float(tol)) or float(tol) <= 0.0):
+                raise ValueError("tol must be finite and positive unless fixed_iters is used")
 
     def _owned_update_row_bounds(self):
         """Return local half-open row bounds for the Jacobi update."""
@@ -422,25 +441,24 @@ class Laplace2DDistributedNCCL:
         """Enqueue Jacobi updates for local rows ``[i0, i1)``."""
         if i0 >= i1:
             return
-
-        threads = (32, 8)
+        
         blocks = (
-            (self.nx - 2 + threads[0] - 1) // threads[0],
-            (i1 - i0 + threads[1] - 1) // threads[1],
+            (self.nx - 2 + self.jacobi_threads[0] - 1) // self.jacobi_threads[0],
+            (i1 - i0 + self.jacobi_threads[1] - 1) // self.jacobi_threads[1],
         )
 
         jacobi_kernel(
             blocks,
-            threads,
+            self.jacobi_threads,
             (
                 self.u,
                 self.unew,
-                np.uint64(self.nx),
+                self.nx_kernel,
                 np.uint64(i0),
                 np.uint64(i1),
-                self.dx2,
-                self.dy2,
-                self.inv_denom,
+                self.dx2_kernel,
+                self.dy2_kernel,
+                self.inv_denom_kernel,
             ),
             stream=stream,
         )
@@ -455,8 +473,6 @@ class Laplace2DDistributedNCCL:
         exists.
         """
         with nvtx_range("jacobi_step_overlapped"):
-            i0, i1 = self._owned_update_row_bounds()
-
             # Every rank must participate in its matching NCCL operations,
             # including a rank that happens to own only a physical boundary
             # row and therefore has no Jacobi row to update. Returning before
@@ -467,81 +483,50 @@ class Laplace2DDistributedNCCL:
             self.comm_stream.wait_event(self.u_ready_event)
             self.exchange_halos_nccl(self.comm_stream)
             self.halos_ready_event.record(self.comm_stream)
-
-            if i0 >= i1:
+            if self.update_i0 >= self.update_i1:
                 # Preserve NCCL ordering before a possible all-reduce and
                 # before publishing the next u_ready_event.
                 self.compute_stream.wait_event(self.halos_ready_event)
                 return
-
-            upper_interface = i0 if self.up is not None else None
-            lower_interface = i1 - 1 if self.down is not None else None
-
-            deep_i0 = i0 + int(self.up is not None)
-            deep_i1 = i1 - int(self.down is not None)
-
             with nvtx_range("jacobi_deep_interior"):
-                self._launch_jacobi_rows(
-                    deep_i0, deep_i1, self.compute_stream
-                )
+                self._launch_jacobi_rows(self.deep_i0, self.deep_i1, self.compute_stream,)
 
             # Only halo-dependent kernels wait. Previously enqueued deep
             # interior work remains eligible to overlap with NCCL.
             self.compute_stream.wait_event(self.halos_ready_event)
 
             with nvtx_range("jacobi_interfaces"):
-                if upper_interface is not None:
-                    self._launch_jacobi_rows(
-                        upper_interface,
-                        upper_interface + 1,
-                        self.compute_stream,
-                    )
+                if self.upper_interface is not None:
+                    self._launch_jacobi_rows(self.upper_interface, self.upper_interface + 1, self.compute_stream,)
+                if (self.lower_interface is not None and self.lower_interface != self.upper_interface):
+                    self._launch_jacobi_rows(self.lower_interface, self.lower_interface + 1, self.compute_stream,)
 
-                if (
-                    lower_interface is not None
-                    and lower_interface != upper_interface
-                ):
-                    self._launch_jacobi_rows(
-                        lower_interface,
-                        lower_interface + 1,
-                        self.compute_stream,
-                    )
+    def compute_local_reduction_rawkernel(self, stream):
+        """
+        Enqueue the local partial norm reductions on stream.
 
-    def compute_local_reduction_rawkernel(self, i0, i1, stream):
-        """Enqueue the local partial reductions on ``stream``."""
-        n = max(0, (i1 - i0) * (self.nx - 2))
-        if n == 0:
-            # This path is not expected under the command-line rank limit,
-            # but keeping it makes the method robust for boundary-only ranks.
-            with stream:
-                zero = cp.asarray(0.0, dtype=cp.float64)
-            return zero, zero
-
-        threads = self.rel_update_norm_threads
-        blocks = min(4096, (n + threads - 1) // threads)
-        shared_mem_bytes = 2 * threads * cp.dtype(cp.float64).itemsize
-
+        This method requires local_update_count > 0.
+        """
         rel_update_norm_partial_kernel(
-            (blocks,),
-            (threads,),
+            (self.rel_update_norm_blocks,), 
+            (self.rel_update_norm_threads,),
             (
                 self.u,
                 self.unew,
                 self.partial_diff,
                 self.partial_norm,
-                np.uint64(self.nx),
-                np.uint64(i0),
-                np.uint64(n),
+                self.nx_kernel, 
+                self.update_i0_kernel, 
+                self.local_update_count_kernel,
             ),
-            shared_mem=shared_mem_bytes,
+            shared_mem=self.rel_update_norm_shared_bytes,
             stream=stream,
         )
-
         with stream:
-            local_diff2 = cp.sum(self.partial_diff[:blocks])
-            local_norm2 = cp.sum(self.partial_norm[:blocks])
-
+            local_diff2 = cp.sum(self.partial_diff[ : self.rel_update_norm_blocks])
+            local_norm2 = cp.sum(self.partial_norm[ : self.rel_update_norm_blocks])
         return local_diff2, local_norm2
+
 
     def compute_relative_l2_update_norm(self):
         """
@@ -553,15 +538,15 @@ class Laplace2DDistributedNCCL:
         """
         with nvtx_range("compute_relative_l2_update_norm"):
             stream = self.compute_stream
-            i0, i1 = self._owned_update_row_bounds()
+            if self.local_update_count > 0:
+                local_diff2, local_norm2 = (self.compute_local_reduction_rawkernel(stream))
 
-            local_diff2, local_norm2 = self.compute_local_reduction_rawkernel(
-                i0, i1, stream
-            )
-
-            with stream:
-                self.red_local[0] = local_diff2
-                self.red_local[1] = local_norm2
+                with stream:
+                    self.red_local[0] = local_diff2
+                    self.red_local[1] = local_norm2
+            else:
+                with stream:
+                    self.red_local.fill(0.0)
 
             self.nccl_comm.all_reduce(
                 self.red_local,
@@ -570,15 +555,9 @@ class Laplace2DDistributedNCCL:
                 stream=stream,
             )
 
-            # The CPU needs the scalar convergence result, so synchronization
-            # is unavoidable at check iterations. Copy both values together.
             stream.synchronize()
             diff2, norm2 = cp.asnumpy(self.red_global)
-
-            rel_update_norm = np.sqrt(diff2) / max(
-                np.sqrt(norm2), 1.0e-300
-            )
-            return float(rel_update_norm)
+            return float(np.sqrt(diff2) / max(np.sqrt(norm2), 1.0e-300))
 
     def _finish_iteration(self):
         """Swap fields and publish the newly computed field to NCCL."""
@@ -624,62 +603,50 @@ class Laplace2DDistributedNCCL:
 
         rel_update_norm = np.inf
         niters = 0
-        nstop = fixed_iters if fixed_iters is not None else max_iters
+        iteration_limit = fixed_iters if fixed_iters is not None else max_iters
 
         with nvtx_range("run"):
-            self.mpi_comm.Barrier()
 
-            start = cp.cuda.Event()
-            stop = cp.cuda.Event()
+            start_event = cp.cuda.Event()
+            stop_event = cp.cuda.Event()
+            self.compute_stream.synchronize()
+            self.comm_stream.synchronize()
+            self.mpi_comm.Barrier()
+            wall_t0 = MPI.Wtime()
 
             # The initial field is already represented by u_ready_event.
             # Start timing on compute_stream and make comm_stream wait on the
             # same timing origin.
-            start.record(self.compute_stream)
-            self.comm_stream.wait_event(start)
+            start_event.record(self.compute_stream)
+            self.comm_stream.wait_event(start_event)
 
-            for it in range(1, nstop + 1):
+            for it in range(1, iteration_limit + 1):
                 self._enqueue_overlapped_jacobi_step()
 
-                do_check = (
-                    it == 1
-                    or it % check_every == 0
-                    or it == nstop
-                )
-
+                do_check = (it == 1 or it % check_every == 0 or it == iteration_limit)
+                converged = False
                 if do_check:
-                    rel_update_norm = (
-                        self.compute_relative_l2_update_norm()
-                    )
-
+                    rel_update_norm = (self.compute_relative_l2_update_norm())
+                    converged = (fixed_iters is None and rel_update_norm < tol)
                 # Always finish and swap exactly once per iteration. Thus
                 # self.u always contains the latest completed/enqueued field.
                 self._finish_iteration()
                 niters = it
-
-                if (
-                    do_check
-                    and fixed_iters is None
-                    and rel_update_norm < tol
-                ):
+                if converged:
                     break
 
             # Every communication operation needed by the final update is an
             # ancestor of compute_stream through halos_ready_event.
-            stop.record(self.compute_stream)
-            stop.synchronize()
+            stop_event.record(self.compute_stream)
+            stop_event.synchronize()
             self.comm_stream.synchronize()
-
-            elapsed_local = (
-                cp.cuda.get_elapsed_time(start, stop) / 1000.0
-            )
-
+            elapsed_cuda_local = (cp.cuda.get_elapsed_time(start_event, stop_event) * 1.0e-3)
             self.mpi_comm.Barrier()
-            elapsed = self.mpi_comm.allreduce(
-                elapsed_local, op=MPI.MAX
-            )
+            elapsed_wall_local = MPI.Wtime() - wall_t0
+            elapsed_cuda_max = self.mpi_comm.allreduce(elapsed_cuda_local, op=MPI.MAX,)
+            elapsed_wall_max = self.mpi_comm.allreduce(elapsed_wall_local, op=MPI.MAX,)
+            return niters, rel_update_norm, elapsed_cuda_max, elapsed_wall_max
 
-        return niters, rel_update_norm, elapsed
 
     def write_parallel_hdf5(
         self, filename, niters=None, rel_update_norm=None
@@ -728,9 +695,9 @@ class Laplace2DDistributedNCCL:
                 dset.attrs["solver"] = "Jacobi"
                 dset.attrs["backend"] = "CuPy + NCCL + mpi4py"
                 dset.attrs["decomposition"] = "1D row decomposition"
-                dset.attrs["communication"] = (
-                    "CuPy NCCL send_recv with communication/computation overlap"
-                )
+                dset.attrs["communication"] = ("CuPy NCCL send_recv with communication/computation overlap")
+                dset.attrs["global_reduction"] = ("NCCL AllReduce on two device FP64 values")
+                dset.attrs["overlap"] = ("deep-interior Jacobi overlaps NCCL halo exchange")
 
                 if niters is not None:
                     dset.attrs["niters"] = niters
@@ -758,7 +725,7 @@ def parse_args():
     parser.add_argument("--bc-right", type=float, default=1.0)
     parser.add_argument("--bc-bottom", type=float, default=0.0)
     parser.add_argument("--bc-top", type=float, default=0.0)
-    parser.add_argument("--output", type=str, default="laplace.h5")
+    parser.add_argument("--output", type=str, default=None, help="Optional parallel HDF5 output filename.",)
     parser.add_argument(
         "--fixed-iters",
         type=int,
@@ -790,22 +757,12 @@ def validate_common_args(args, mpi_comm):
         args.lx <= 0.0 or args.ly <= 0.0,
         "lx and ly must be positive",
     )
-
-    # Keep the original conservative rank limit. A remainder decomposition
-    # can still produce a boundary-only end rank for some (ny, size) pairs;
-    # the solver handles that case by participating in NCCL and contributing
-    # zero to the local convergence reduction.
-    abort_if(
-        size > args.ny - 2,
-        "number of MPI ranks must be <= ny - 2",
-    )
-
+    # Full-row decomposition permits at most ny ranks.
+    # Boundary-only ranks are supported but perform no Jacobi updates.
+    abort_if(size > args.ny, "number of MPI ranks must be <= ny for full-row decomposition",)
     abort_if(args.max_iters < 1, "max_iters must be at least 1")
     abort_if(args.check_every < 1, "check_every must be at least 1")
-    abort_if(
-        args.fixed_iters is not None and args.fixed_iters < 1,
-        "fixed_iters must be at least 1",
-    )
+    abort_if(args.fixed_iters is not None and args.fixed_iters < 1, "fixed_iters must be at least 1",)
 
     if args.fixed_iters is None:
         abort_if(
@@ -828,33 +785,41 @@ def main():
     rank = mpi_comm.Get_rank()
     size = mpi_comm.Get_size()
 
+    provided_thread_level = MPI.Query_thread()
+    if provided_thread_level < MPI.THREAD_FUNNELED:
+        if rank == 0:
+            print("Error: MPI did not provide MPI_THREAD_FUNNELED.", flush=True,)
+        mpi_comm.Abort(1)
+
     # One MPI rank owns one GPU.
-    local_rank = get_local_rank(mpi_comm)
-    ndev = cp.cuda.runtime.getDeviceCount()
+    try:
+        local_rank = get_local_rank(mpi_comm)
+        ndev = cp.cuda.runtime.getDeviceCount()
+    except Exception as exc:
+        print(f"rank {rank}: CUDA/local-rank discovery failed: {exc}", flush=True,)
+        mpi_comm.Abort(1)
 
     if ndev <= 0:
         if rank == 0:
             print("Error: no CUDA devices found", flush=True)
         mpi_comm.Abort(1)
-
+    
     if local_rank >= ndev:
-        if rank == 0:
-            print(
-                "Error: more local MPI ranks than visible CUDA devices.\n"
-                "Use one MPI rank per GPU or explicitly implement GPU "
-                "oversubscription.",
-                flush=True,
-            )
+        print(f"rank {rank}: local_rank={local_rank} is out of range; visible CUDA devices on this node: {ndev}. "
+               "Use one MPI rank per GPU.", flush=True,)
         mpi_comm.Abort(1)
 
-    cp.cuda.Device(local_rank).use()
-
-    nccl_comm = init_process_group(
-        size,
-        rank,
-        backend="nccl",
-        use_mpi=True,
-    )
+    try:
+        cp.cuda.Device(local_rank).use()
+        nccl_comm = init_process_group(
+            size,
+            rank,
+            backend="nccl",
+            use_mpi=True,
+        )
+    except Exception as exc:
+        print(f"rank {rank}: NCCL initialization failed: {exc}", flush=True,)
+        mpi_comm.Abort(1)
 
     if not hasattr(nccl_comm, "send_recv"):
         if rank == 0:
@@ -873,20 +838,24 @@ def main():
                 flush=True,
             )
         mpi_comm.Abort(1)
-
-    solver = Laplace2DDistributedNCCL(
-        nx=args.nx,
-        ny=args.ny,
-        lx=args.lx,
-        ly=args.ly,
-        nccl_comm=nccl_comm,
-        mpi_comm=mpi_comm,
-        bc_left=args.bc_left,
-        bc_right=args.bc_right,
-        bc_bottom=args.bc_bottom,
-        bc_top=args.bc_top,
-        dtype=cp.float64,
-    )
+    
+    try:
+        solver = Laplace2DDistributedNCCL(
+            nx=args.nx,
+            ny=args.ny,
+            lx=args.lx,
+            ly=args.ly,
+            nccl_comm=nccl_comm,
+            mpi_comm=mpi_comm,
+            bc_left=args.bc_left,
+            bc_right=args.bc_right,
+            bc_bottom=args.bc_bottom,
+            bc_top=args.bc_top,
+            dtype=cp.float64,
+        )
+    except Exception as exc:
+        print(f"rank {rank}: solver initialization failed: {exc}", flush=True,)
+        mpi_comm.Abort(1)
 
     if rank == 0:
         print("Distributed CuPy/NCCL Laplace solver with overlap")
@@ -908,17 +877,20 @@ def main():
 
         print("", flush=True)
 
-    device_id = cp.cuda.Device().id
-    props = cp.cuda.runtime.getDeviceProperties(device_id)
-    raw_name = props["name"]
-    gpu_name = (
-        raw_name.decode() if isinstance(raw_name, bytes) else str(raw_name)
-    )
+    try:
+        device_id = cp.cuda.Device().id
+        props = cp.cuda.runtime.getDeviceProperties(device_id)
+        raw_name = props["name"]
+        gpu_name = (raw_name.decode() if isinstance(raw_name, bytes) else str(raw_name))
+    except Exception as exc:
+        print(f"rank {rank}: failed to query CUDA device properties: {exc}", flush=True,)
+        mpi_comm.Abort(1)
 
-    itemsize = cp.dtype(cp.float64).itemsize
-    local_bytes_per_array = (
-        (solver.local_ny + 2) * solver.nx * itemsize
-    )
+    itemsize = np.dtype(np.float64).itemsize
+    local_field_bytes = ((solver.local_ny + 2) * solver.nx * itemsize)
+    partial_bytes = (2 * solver.rel_update_norm_blocks * itemsize)
+    reduction_buffer_bytes = 4 * itemsize
+    explicit_device_bytes = (2 * local_field_bytes + partial_bytes + reduction_buffer_bytes)
     global_bytes_per_array = args.ny * args.nx * itemsize
 
     ordered_print(
@@ -931,7 +903,8 @@ def main():
             f"global rows [{solver.ystart}:{solver.yend}) | "
             f"local_ny={solver.local_ny} | "
             f"local array={solver.u.shape} | "
-            f"memory/field={local_bytes_per_array / 1024**2:.2f} MiB"
+            f"memory/field={local_field_bytes / 1024**2:.2f} MiB | "
+            f"explicit_device={explicit_device_bytes / 1024**2:.2f} MiB"
         ),
     )
 
@@ -943,34 +916,74 @@ def main():
         )
         print("", flush=True)
         print("Warming up CuPy + NCCL overlap path...", flush=True)
-
-    solver.warmup()
+    
+    try:
+        solver.warmup()
+    except Exception as exc:
+        print(f"rank {rank}: NCCL warm-up failed: {exc}", flush=True,)
+        mpi_comm.Abort(1)
 
     if rank == 0:
         print("Warm-up complete.", flush=True)
 
-    niters, rel_update_norm, elapsed = solver.run(
-        max_iters=args.max_iters,
-        tol=args.tol,
-        check_every=args.check_every,
-        fixed_iters=args.fixed_iters,
-    )
-    
-    if args.output is not None:
-        solver.write_parallel_hdf5(args.output, niters=niters, rel_update_norm=rel_update_norm)
-    
-    global_updates_per_iter = (args.nx - 2) * (args.ny - 2)
-    gupdates_per_second = (global_updates_per_iter * niters / elapsed / 1.0e9 )
+    try:
+        niters, rel_update_norm, elapsed_cuda_event, elapsed_wall = solver.run(
+            max_iters=args.max_iters,
+            tol=args.tol,
+            check_every=args.check_every,
+            fixed_iters=args.fixed_iters,
+        )
+    except Exception as exc:
+        print(f"rank {rank}: solver run failed: {exc}", flush=True,)
+        mpi_comm.Abort(1)
+
+    converged = (args.fixed_iters is None and rel_update_norm < args.tol)
+
+    global_updates_per_iter = ((args.nx - 2) * (args.ny - 2))
+    total_updates = global_updates_per_iter * niters
+    gupdates_per_second_cuda_event = (total_updates / elapsed_cuda_event / 1.0e9 if elapsed_cuda_event > 0.0 else float("inf"))
+    gupdates_per_second_wall       = (total_updates / elapsed_wall       / 1.0e9 if elapsed_wall       > 0.0 else float("inf"))
 
     if rank == 0:
+        print()
+        print("============================================================")
+        print("Solver summary")
+        print("============================================================")
+        print(f"CuPy RawKernel + NCCL iterations                 : {niters}")
+        if args.fixed_iters is None:
+            print(f"CuPy RawKernel + NCCL converged                  : {converged}")
+        else:
+            print("CuPy RawKernel + NCCL convergence used to stop   : no")
+        print(f"CuPy RawKernel + NCCL final relative update norm : {rel_update_norm:.6e}")
+        print(f"CuPy RawKernel + NCCL CUDA-event interval [s]    : {elapsed_cuda_event:.6f}")
+        print(f"CuPy RawKernel + NCCL wall elapsed time [s]      : {elapsed_wall:.6f}")
+        print(f"CuPy RawKernel + NCCL CUDA-event time/iter [ms]  : {1000.0 * elapsed_cuda_event / max(niters, 1):.6f}")
+        print(f"CuPy RawKernel + NCCL wall time/iter [ms]        : {1000.0 * elapsed_wall / max(niters, 1):.6f}")
+        print(f"CuPy RawKernel + NCCL CUDA-event GUpdates/s      : {gupdates_per_second_cuda_event:.6f}")
+        print(f"CuPy RawKernel + NCCL wall GUpdates/s            : {gupdates_per_second_wall:.6f}")
+    if args.output is not None:
+        try:
+            solver.write_parallel_hdf5(args.output, niters=niters, rel_update_norm=rel_update_norm,)
+        except Exception as exc:
+            print(f"rank {rank}: parallel HDF5 output failed: {exc}", flush=True,)
+            mpi_comm.Abort(1)
+        if rank == 0:
+            print(f"CuPy RawKernel + NCCL wrote solution           : {args.output}", flush=True,)
+    if rank == 0:
         print("", flush=True)
-        print(f"RawCuPy+NCCL iterations                     : {niters}")
-        print(f"RawCuPy+NCCL final relative update norm     : {rel_update_norm:.6e}")
-        print(f"RawCuPy+NCCL elapsed time [s]               : {elapsed:.6f}")
-        print(f"RawCuPy+NCCL time per iter [ms]             : {1000.0 * elapsed / max(niters, 1):.6f}")
-        print(f"RawCuPy+NCCL Jacobi throughput [GUpdates/s] : {gupdates_per_second:.6f}")
-        print(f"RawCuPy+NCCL wrote solution                 : {args.output}")
-        print("", flush=True)
+    try:
+        solver.compute_stream.synchronize()
+        solver.comm_stream.synchronize()
+        mpi_comm.Barrier()
+        if hasattr(nccl_comm, "destroy"):
+            nccl_comm.destroy()
+        elif hasattr(nccl_comm, "close"):
+            nccl_comm.close()
+    except Exception as exc:
+        print(f"rank {rank}: NCCL cleanup failed: {exc}", flush=True,)
+        mpi_comm.Abort(1)
 
 if __name__ == "__main__":
     main()
+
+

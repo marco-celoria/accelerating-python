@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
+from contextlib import contextmanager
+from time import perf_counter
+
 import cupy as cp
 import numpy as np
-from contextlib import contextmanager
-
 
 @contextmanager
 def nvtx_range(name: str, id_color: int = -1):
@@ -45,7 +46,7 @@ class Laplace2DCuPy:
         bc_bottom=0.0,
         bc_top=0.0,
     ):  
-        Laplace2DCuPy._validate_problem_parameters(nx, ny, lx, ly, bc_left, bc_right, bc_bottom, bc_top)
+        self._validate_problem_parameters(nx, ny, lx, ly, bc_left, bc_right, bc_bottom, bc_top)
         self.nx = int(nx)
         self.ny = int(ny)
         self.lx = float(lx)
@@ -88,11 +89,12 @@ class Laplace2DCuPy:
 
     @staticmethod
     def _validate_run_parameters(max_iters, tol, check_every, fixed_iters):
-        if not isinstance(max_iters, int):
+        integer_types = (int, np.integer)
+        if not isinstance(max_iters, integer_types):
             raise TypeError("max_iters must be an integer")
-        if not isinstance(check_every, int):
+        if not isinstance(check_every, integer_types):
             raise TypeError("check_every must be an integer")
-        if fixed_iters is not None and not isinstance(fixed_iters, int):
+        if (fixed_iters is not None and not isinstance(fixed_iters, integer_types)):
             raise TypeError("fixed_iters must be an integer")
         if max_iters < 1:
             raise ValueError("max_iters must be at least 1")
@@ -107,7 +109,11 @@ class Laplace2DCuPy:
 
     # Boundary conditions
     def _apply_dirichlet_bc(self, arr):
-        # same order as NumPy + distributed solver
+        """
+        Apply Dirichlet boundary conditions.
+        Top and bottom conditions are applied last and therefore
+        determine the values at the four corners.
+        """
         with nvtx_range("_apply_dirichlet_bc"):
             arr[ :,  0] = self.bc_left
             arr[ :, -1] = self.bc_right
@@ -135,23 +141,19 @@ class Laplace2DCuPy:
             self.unew[1:-1, 1:-1] = self.inv_denom * (
                       (self.u[1:-1, :-2] + self.u[1:-1, 2:]) * self.dy2
                     + (self.u[:-2, 1:-1] + self.u[2:, 1:-1]) * self.dx2)
-            # Boundaries are initialized once in both u and unew.
-            # Since this update only writes: self.unew[1:-1, 1:-1]
-            # the boundary entries of unew remain unchanged after initialization.
-            # Since jacobi_step writes only interior points, boundaries remain valid across ping-pong swaps.
-            #self._apply_dirichlet_bc(self.unew) <- Not needed because only interior points are overwritten.
-
+            # Both arrays are initialized with identical Dirichlet boundaries.
+            # Only interior values are updated, so boundaries remain valid
+            # throughout the ping-pong swaps.
+    
     # Relative update norm
     def compute_relative_l2_update_norm(self):
-        rel_update_norm = 0.0
         with nvtx_range("compute_relative_l2_update_norm"): 
             diff = self.unew[1:-1, 1:-1] - self.u[1:-1, 1:-1]
             interior = self.unew[1:-1, 1:-1]
             diff2 = cp.sum(diff * diff)
             norm2 = cp.sum(interior * interior)
             rel_update_norm_gpu = cp.sqrt(diff2) / cp.maximum(cp.sqrt(norm2), 1.0e-300)
-            rel_update_norm = rel_update_norm_gpu.get()
-        return float(rel_update_norm)
+            return float(rel_update_norm_gpu.get())
 
 
     def warmup(self):
@@ -170,37 +172,37 @@ class Laplace2DCuPy:
     def run(self, max_iters, tol, check_every, fixed_iters=None):
         rel_update_norm = float("inf")
         niters = 0
-        elapsed = 0.0
         with nvtx_range("run"):
-            Laplace2DCuPy._validate_run_parameters(max_iters, tol, check_every, fixed_iters)
-            nstop = fixed_iters if fixed_iters is not None else max_iters
+            self._validate_run_parameters(max_iters, tol, check_every, fixed_iters)
+            iteration_limit = fixed_iters if fixed_iters is not None else max_iters
             start = cp.cuda.Event()
             stop = cp.cuda.Event()
             # Make sure all previous GPU work is finished before timing.
             cp.cuda.get_current_stream().synchronize()
+            t0 = perf_counter()
             start.record()
-            for it in range(1, nstop + 1):
+            for it in range(1, iteration_limit + 1):
                 self.jacobi_step()
-                do_check = (it == 1 or it % check_every == 0 or it == nstop)
+                do_check = (it == 1 or it % check_every == 0 or it == iteration_limit)
+                converged = False
                 if do_check:
                     rel_update_norm = self.compute_relative_l2_update_norm()
+                    converged = (fixed_iters is None and rel_update_norm < tol)
                     # Device scalars must be copied to the host before Python control flow can use them.
-                    if fixed_iters is None and rel_update_norm < tol:
-                        self.u, self.unew = self.unew, self.u
-                        niters = it
-                        break
                 self.u, self.unew = self.unew, self.u
                 niters = it
+                if converged:
+                    break
             stop.record()
             stop.synchronize()
-            elapsed = cp.cuda.get_elapsed_time(start, stop) / 1000.0
-        return niters, rel_update_norm, elapsed
+            elapsed_gpu = cp.cuda.get_elapsed_time(start, stop) / 1000.0
+            elapsed_wall = perf_counter() - t0
+        return niters, rel_update_norm, elapsed_gpu, elapsed_wall
 
     # Output
     def write_hdf5(self, filename, niters, rel_update_norm):
         with nvtx_range("write_hdf5"):
             import h5py
-            cp.cuda.get_current_stream().synchronize()
             with h5py.File(filename, "w") as f:
                 dset = f.create_dataset("u", data=cp.asnumpy(self.u))
                 dset.attrs["nx"] = self.nx
@@ -311,25 +313,38 @@ def main():
     solver.warmup()
     print("Warm-up complete.", flush=True)
 
-    niters, rel_update_norm, elapsed = solver.run(
+    niters, rel_update_norm, elapsed_gpu, elapsed_wall = solver.run(
         max_iters=args.max_iters,
         tol=args.tol,
         check_every=args.check_every,
         fixed_iters=args.fixed_iters,
     )
     
-    global_updates_per_iter = (args.nx - 2) * (args.ny - 2)
-    gupdates_per_second = (global_updates_per_iter * niters / elapsed / 1.0e9 )
+    global_updates_per_iter = ((args.nx - 2) * (args.ny - 2))
+    total_updates = global_updates_per_iter * niters
+    gupdates_per_second_gpu  = (total_updates / elapsed_gpu  / 1.0e9 if elapsed_gpu  > 0.0 else float("inf"))
+    gupdates_per_second_wall = (total_updates / elapsed_wall / 1.0e9 if elapsed_wall > 0.0 else float("inf"))
 
-    print(f"CuPy iterations                     : {niters}")
-    print(f"CuPy final relative update norm     : {rel_update_norm:.6e}")
-    print(f"CuPy elapsed time [s]               : {elapsed:.6f}")
-    print(f"CuPy time per iter [ms]             : {1000.0 * elapsed / max(niters, 1):.6f}")
-    print(f"CuPy Jacobi throughput [GUpdates/s] : {gupdates_per_second:.6f}")
-
+    converged = (args.fixed_iters is None and rel_update_norm < args.tol)
+    print()
+    print("============================================================")
+    print("Solver summary")
+    print("============================================================")
+    print(f"CuPy iterations                         : {niters}")
+    if args.fixed_iters is None:
+        print(f"CuPy converged                          : {converged}")
+    else:
+        print("CuPy convergence used for stopping      : no")
+    print(f"CuPy final relative update norm         : {rel_update_norm:.6e}")
+    print(f"CuPy CUDA-event solver interval [s]     : {elapsed_gpu:.6f}")
+    print(f"CuPy wall elapsed time [s]              : {elapsed_wall:.6f}")
+    print(f"CuPy CUDA-event time per iter [ms]      : {1000.0 * elapsed_gpu / max(niters, 1):.6f}")
+    print(f"CuPy wall time per iter [ms]            : {1000.0 * elapsed_wall / max(niters, 1):.6f}")
+    print(f"CuPy CUDA-event throughput [GUpdates/s] : {gupdates_per_second_gpu:.6f}")
+    print(f"CuPy wall throughput [GUpdates/s]       : {gupdates_per_second_wall:.6f}")
     if args.output is not None:
         solver.write_hdf5(args.output, niters, rel_update_norm)
-        print(f"CuPy wrote solution                 : {args.output}")
+        print(f"CuPy wrote solution                     : {args.output}")
     print("", flush=True)
 
 
