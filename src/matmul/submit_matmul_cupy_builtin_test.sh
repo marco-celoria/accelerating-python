@@ -6,7 +6,7 @@
 #SBATCH --time=0:30:00
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH --job-name=run_matmul_cupy_at_test
+#SBATCH --job-name=run_matmul_cupy_builtin_test
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
 #SBATCH --gres=gpu:1
@@ -28,13 +28,13 @@ cd ..
 source pygpu_venv/bin/activate
 cd -
 
-python matmul_cupy_at.py 999 623 379 10
-python matmul_cupy_at.py 999 379 623 10
-python matmul_cupy_at.py 623 999 379 10
-python matmul_cupy_at.py 623 379 999 10
-python matmul_cupy_at.py 379 999 623 10
-python matmul_cupy_at.py 379 623 999 10
-python matmul_cupy_at.py 999 999 999 10
-python matmul_cupy_at.py 623 623 623 10
-python matmul_cupy_at.py 379 379 379 10
+python matmul_cupy_builtin.py 999 623 379 10
+python matmul_cupy_builtin.py 999 379 623 10
+python matmul_cupy_builtin.py 623 999 379 10
+python matmul_cupy_builtin.py 623 379 999 10
+python matmul_cupy_builtin.py 379 999 623 10
+python matmul_cupy_builtin.py 379 623 999 10
+python matmul_cupy_builtin.py 999 999 999 10
+python matmul_cupy_builtin.py 623 623 623 10
+python matmul_cupy_builtin.py 379 379 379 10
 

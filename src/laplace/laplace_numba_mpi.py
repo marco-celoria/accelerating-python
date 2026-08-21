@@ -360,9 +360,10 @@ class Laplace2DDistributedNumbaCUDAAwareMPI:
 
     def compute_relative_l2_update_norm(self):
         """
-        Compute the global relative L2 update norm:
+        Compute the global relative L2 iterate-update norm:
             ||u_new - u||_2 / ||u_new||_2
-        over true global interior points only.
+        over the global physical interior.
+        This convergence indicator is not the discrete Laplace residual.
         Local sums are computed on the GPU with cuda.reduce.
         Two FP64 host values are then combined with MPI Allreduce.
         """
@@ -441,7 +442,6 @@ class Laplace2DDistributedNumbaCUDAAwareMPI:
             stop_event.record()
             stop_event.synchronize()
             elapsed_cuda_local = (cuda.event_elapsed_time(start_event, stop_event,) * 1.0e-3)
-            self.mpi_comm.Barrier()
             elapsed_wall_local = MPI.Wtime() - wall_t0
             elapsed_cuda_max = self.mpi_comm.allreduce(elapsed_cuda_local,op=MPI.MAX,)
             elapsed_wall_max = self.mpi_comm.allreduce(elapsed_wall_local,op=MPI.MAX,)
@@ -489,6 +489,7 @@ class Laplace2DDistributedNumbaCUDAAwareMPI:
                 dset.attrs["backend"] = ("Numba CUDA + CUDA-aware MPI halo exchange + mpi4py")
                 dset.attrs["communication"] = ("CUDA-aware MPI Sendrecv halos; host MPI Allreduce for norm")
                 dset.attrs["rel_update_norm_method"] = ("Numba CUDA map kernel + cuda.reduce + host MPI Allreduce")
+                dset.attrs["convergence_metric"] = ("relative L2 iterate-update norm over global physical interior")
                 if niters is not None:
                     dset.attrs["niters"] = niters
                 if rel_update_norm is not None:
@@ -516,7 +517,8 @@ def parse_args():
     parser.add_argument("--bc-top", type=float, default=0.0)
     parser.add_argument("--output", type=str, default=None, help="Optional parallel HDF5 output filename.",)
     parser.add_argument("--fixed-iters", type=int, default=None,
-        help="Run exactly this many iterations, ignoring tolerance.",
+        help=("Run exactly this many iterations without tolerance-based termination. "
+              "The update norm is still evaluated according to --check-every."),
     )
     return parser.parse_args()
 
@@ -541,6 +543,8 @@ def validate_common_args(args, mpi_comm):
         if rank == 0:
             print("Error: number of MPI ranks must be <= ny for full-row decomposition.", flush=True,)
         mpi_comm.Abort(1)
+    if rank == 0 and size > args.ny - 2:
+        print("Warning: one or more MPI ranks own only physical boundary rows and perform no Jacobi updates.", flush=True,)
     if args.max_iters < 1:
         if rank == 0:
             print("Error: max_iters must be at least 1", flush=True)
@@ -564,7 +568,7 @@ def validate_common_args(args, mpi_comm):
             if rank == 0:
                 print(f"Error: {name} must be finite", flush=True)
             mpi_comm.Abort(1)
-
+   
 def main():
     args = parse_args()
     mpi_comm = MPI.COMM_WORLD
@@ -594,12 +598,13 @@ def main():
         print(f"rank {rank}: no visible CUDA devices", flush=True,)
         mpi_comm.Abort(1)
 
-    if local_rank >= ndev:
-        print(f"Error on rank {rank}: local_rank={local_rank} but only {ndev} CUDA devices are visible", flush=True,)
+    device_id = 0 if ndev == 1 else local_rank
+    if device_id >= ndev:
+        print(f"rank {rank}: cannot map local_rank={local_rank} to {ndev} visible GPU(s)", flush=True,)
         mpi_comm.Abort(1)
     
     try:
-        cuda.select_device(local_rank)
+        cuda.select_device(device_id)
         solver = Laplace2DDistributedNumbaCUDAAwareMPI(
             nx=args.nx,
             ny=args.ny,
@@ -634,7 +639,6 @@ def main():
     
     try:
         device = cuda.get_current_device()
-        device_id = local_rank
         gpu_name = (device.name.decode() if isinstance(device.name, bytes) else str(device.name))
     except Exception as exc:
         print(f"rank {rank}: failed to query CUDA device properties: {exc}", flush=True)
@@ -692,6 +696,8 @@ def main():
         mpi_comm.Abort(1)
 
     converged = (args.fixed_iters is None and rel_update_norm < args.tol)
+    if rank == 0 and args.fixed_iters is None and not converged:
+        print("Warning: maximum iteration count reached before the requested tolerance was satisfied.", flush=True,)
     global_updates_per_iter = ((args.nx - 2) * (args.ny - 2))
     total_updates = (global_updates_per_iter * niters)
     gupdates_per_second_cuda_event = (total_updates / elapsed_cuda_event / 1.0e9 if elapsed_cuda_event > 0.0 else float("inf"))
@@ -703,19 +709,21 @@ def main():
         print("============================================================")
         print("Solver summary")
         print("============================================================")
-        print(f"Numba CUDA + MPI iterations                  : {niters}")
+        print("Implementation                                           : Numba CUDA fused Jacobi + CUDA-aware MPI")
+        print(f"Numba CUDA + MPI iterations                              : {niters}")
         if args.fixed_iters is None:
-            print(f"Numba CUDA + MPI converged                   : {converged}")
+            print(f"Numba CUDA + MPI converged                               : {converged}")
         else:
-            print("Numba CUDA + MPI convergence used to stop    : no")
+            print("Numba CUDA + MPI convergence used to stop                : no")
 
-        print(f"Numba CUDA + MPI final relative update norm  : {rel_update_norm:.6e}")
-        print(f"Numba CUDA + MPI CUDA-event interval [s]     : {elapsed_cuda_event:.6f}")
-        print(f"Numba CUDA + MPI wall elapsed time [s]       : {elapsed_wall:.6f}")
-        print(f"Numba CUDA + MPI CUDA-event time/iter [ms]   : {1000.0 * elapsed_cuda_event / max(niters, 1):.6f}")
-        print(f"Numba CUDA + MPI wall time/iter [ms]         : {1000.0 * elapsed_wall / max(niters, 1):.6f}")
-        print(f"Numba CUDA + MPI CUDA-event GUpdates/s       : {gupdates_per_second_cuda_event:.6f}")
-        print(f"Numba CUDA + MPI wall GUpdates/s             : {gupdates_per_second_wall:.6f}")
+        print(f"Numba CUDA + MPI final relative iterate-update norm      : {rel_update_norm:.6e}")
+        print(f"Numba CUDA + MPI CUDA-event interval [s]                 : {elapsed_cuda_event:.6f}")
+        print(f"Numba CUDA + MPI wall elapsed time [s]                   : {elapsed_wall:.6f}")
+        print(f"Numba CUDA + MPI CUDA-event time/iter [ms]               : {1000.0 * elapsed_cuda_event / max(niters, 1):.6f}")
+        print(f"Numba CUDA + MPI wall time/iter [ms]                     : {1000.0 * elapsed_wall / max(niters, 1):.6f}")
+        print("Throughput metric: effective monitored distributed solver")
+        print(f"Numba CUDA + MPI CUDA-event throughput [GCell-updates/s] : {gupdates_per_second_cuda_event:.6f}")
+        print(f"Numba CUDA + MPI wall throughput [GCell-updates/s]       : {gupdates_per_second_wall:.6f}")
     if args.output is not None:
         try:
             solver.write_parallel_hdf5(args.output, niters, rel_update_norm,)
@@ -723,7 +731,7 @@ def main():
             print(f"rank {rank}: parallel HDF5 output failed: {exc}", flush=True,)
             mpi_comm.Abort(1)
         if rank == 0:
-            print(f"Numba CUDA + MPI wrote solution              : {args.output}")
+            print(f"Numba CUDA + MPI wrote solution                          : {args.output}")
     if rank == 0:
         print("", flush=True)
 

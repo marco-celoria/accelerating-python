@@ -530,10 +530,12 @@ class Laplace2DDistributedNCCL:
 
     def compute_relative_l2_update_norm(self):
         """
-        Compute ||unew - u||_2 / ||unew||_2 globally.
-
-        This method is called after all Jacobi kernels have been enqueued on
-        ``compute_stream``. Stream ordering therefore makes the reduction wait
+        Compute the global relative L2 iterate-update norm:
+            ||u_new - u||_2 / ||u_new||_2
+        over the global physical interior.
+        This convergence indicator is not the discrete Laplace residual.
+        This method is called after all Jacobi kernels have been enqueued on compute_stream. 
+        Stream ordering therefore makes the reduction wait
         for the complete update without a device-wide synchronization.
         """
         with nvtx_range("compute_relative_l2_update_norm"):
@@ -641,7 +643,6 @@ class Laplace2DDistributedNCCL:
             stop_event.synchronize()
             self.comm_stream.synchronize()
             elapsed_cuda_local = (cp.cuda.get_elapsed_time(start_event, stop_event) * 1.0e-3)
-            self.mpi_comm.Barrier()
             elapsed_wall_local = MPI.Wtime() - wall_t0
             elapsed_cuda_max = self.mpi_comm.allreduce(elapsed_cuda_local, op=MPI.MAX,)
             elapsed_wall_max = self.mpi_comm.allreduce(elapsed_wall_local, op=MPI.MAX,)
@@ -698,7 +699,8 @@ class Laplace2DDistributedNCCL:
                 dset.attrs["communication"] = ("CuPy NCCL send_recv with communication/computation overlap")
                 dset.attrs["global_reduction"] = ("NCCL AllReduce on two device FP64 values")
                 dset.attrs["overlap"] = ("deep-interior Jacobi overlaps NCCL halo exchange")
-
+                dset.attrs["convergence_metric"] = ("relative L2 iterate-update norm over global physical interior")
+                dset.attrs["rel_update_norm_method"] = ("CUDA partial reduction + CuPy reduction + NCCL AllReduce")
                 if niters is not None:
                     dset.attrs["niters"] = niters
                 if rel_update_norm is not None:
@@ -726,11 +728,9 @@ def parse_args():
     parser.add_argument("--bc-bottom", type=float, default=0.0)
     parser.add_argument("--bc-top", type=float, default=0.0)
     parser.add_argument("--output", type=str, default=None, help="Optional parallel HDF5 output filename.",)
-    parser.add_argument(
-        "--fixed-iters",
-        type=int,
-        default=None,
-        help="Run exactly this many iterations, ignoring tolerance.",
+    parser.add_argument("--fixed-iters", type=int, default=None,
+        help=("Run exactly this many iterations without tolerance-based termination. "
+              "The update norm is still evaluated according to --check-every."),
     )
     return parser.parse_args()
 
@@ -745,18 +745,9 @@ def validate_common_args(args, mpi_comm):
                 print(f"Error: {message}", flush=True)
             mpi_comm.Abort(1)
 
-    abort_if(
-        args.nx < 3 or args.ny < 3,
-        "nx and ny must both be at least 3",
-    )
-    abort_if(
-        not np.isfinite(args.lx) or not np.isfinite(args.ly),
-        "lx and ly must be finite",
-    )
-    abort_if(
-        args.lx <= 0.0 or args.ly <= 0.0,
-        "lx and ly must be positive",
-    )
+    abort_if(args.nx < 3 or args.ny < 3, "nx and ny must both be at least 3",)
+    abort_if(not np.isfinite(args.lx) or not np.isfinite(args.ly), "lx and ly must be finite",)
+    abort_if(args.lx <= 0.0 or args.ly <= 0.0, "lx and ly must be positive",)
     # Full-row decomposition permits at most ny ranks.
     # Boundary-only ranks are supported but perform no Jacobi updates.
     abort_if(size > args.ny, "number of MPI ranks must be <= ny for full-row decomposition",)
@@ -765,16 +756,10 @@ def validate_common_args(args, mpi_comm):
     abort_if(args.fixed_iters is not None and args.fixed_iters < 1, "fixed_iters must be at least 1",)
 
     if args.fixed_iters is None:
-        abort_if(
-            not np.isfinite(args.tol) or args.tol <= 0.0,
-            "tol must be finite and positive unless fixed_iters is used",
-        )
+        abort_if(not np.isfinite(args.tol) or args.tol <= 0.0, "tol must be finite and positive unless fixed_iters is used",)
 
     for name in ("bc_left", "bc_right", "bc_bottom", "bc_top"):
-        abort_if(
-            not np.isfinite(getattr(args, name)),
-            f"{name} must be finite",
-        )
+        abort_if(not np.isfinite(getattr(args, name)), f"{name} must be finite",)
 
 
 def main():
@@ -804,13 +789,13 @@ def main():
             print("Error: no CUDA devices found", flush=True)
         mpi_comm.Abort(1)
     
-    if local_rank >= ndev:
-        print(f"rank {rank}: local_rank={local_rank} is out of range; visible CUDA devices on this node: {ndev}. "
-               "Use one MPI rank per GPU.", flush=True,)
+    device_id = 0 if ndev == 1 else local_rank
+    if device_id >= ndev:
+        print(f"rank {rank}: cannot map local_rank={local_rank} to {ndev} visible GPU(s)", flush=True,)
         mpi_comm.Abort(1)
 
     try:
-        cp.cuda.Device(local_rank).use()
+        cp.cuda.Device(device_id).use()
         nccl_comm = init_process_group(
             size,
             rank,
@@ -820,23 +805,15 @@ def main():
     except Exception as exc:
         print(f"rank {rank}: NCCL initialization failed: {exc}", flush=True,)
         mpi_comm.Abort(1)
+    
+    if rank == 0:
+        print(f"CuPy version: {cp.__version__}", flush=True)
+        print(f"NCCL communicator type: {type(nccl_comm).__name__}",flush=True,)
 
     if not hasattr(nccl_comm, "send_recv"):
         if rank == 0:
-            print(
-                "Error: this CuPy NCCL backend does not provide send_recv().",
-                flush=True,
-            )
-            print(f"CuPy version: {cp.__version__}", flush=True)
-            print(
-                f"NCCL communicator type: {type(nccl_comm)}",
-                flush=True,
-            )
-            print(
-                "Use explicit grouped NCCL send/recv or adapt "
-                "exchange_halos_nccl().",
-                flush=True,
-            )
+            print("Error: this CuPy NCCL backend does not provide send_recv().", flush=True,)
+            print("Use explicit grouped NCCL send/recv or adapt exchange_halos_nccl().", flush=True,)
         mpi_comm.Abort(1)
     
     try:
@@ -857,6 +834,14 @@ def main():
         print(f"rank {rank}: solver initialization failed: {exc}", flush=True,)
         mpi_comm.Abort(1)
 
+    local_deep_rows = max(0, solver.deep_i1 - solver.deep_i0,)
+    min_deep_rows = mpi_comm.allreduce(local_deep_rows, op=MPI.MIN,)
+    has_zero_update_rank = mpi_comm.allreduce(int(solver.local_update_count == 0), op=MPI.MAX,)
+    if rank == 0 and has_zero_update_rank:
+        print("Warning: one or more ranks own no global interior rows and perform no Jacobi updates.", flush=True,)
+    elif rank == 0 and min_deep_rows == 0:
+        print("Warning: at least one rank has no deep-interior rows; communication/computation overlap will be limited.", flush=True,)
+    
     if rank == 0:
         print("Distributed CuPy/NCCL Laplace solver with overlap")
         print(f"  global grid       : ny={args.ny}, nx={args.nx}")
@@ -938,7 +923,9 @@ def main():
         mpi_comm.Abort(1)
 
     converged = (args.fixed_iters is None and rel_update_norm < args.tol)
-
+    if rank == 0 and args.fixed_iters is None and not converged:
+        print("Warning: maximum iteration count reached before the requested tolerance was satisfied.", flush=True,)
+    
     global_updates_per_iter = ((args.nx - 2) * (args.ny - 2))
     total_updates = global_updates_per_iter * niters
     gupdates_per_second_cuda_event = (total_updates / elapsed_cuda_event / 1.0e9 if elapsed_cuda_event > 0.0 else float("inf"))
@@ -949,18 +936,20 @@ def main():
         print("============================================================")
         print("Solver summary")
         print("============================================================")
-        print(f"CuPy RawKernel + NCCL iterations                 : {niters}")
+        print("Implementation                                                : CuPy RawKernel Jacobi + overlapped NCCL communication")
+        print(f"CuPy RawKernel + NCCL iterations                              : {niters}")
         if args.fixed_iters is None:
-            print(f"CuPy RawKernel + NCCL converged                  : {converged}")
+            print(f"CuPy RawKernel + NCCL converged                               : {converged}")
         else:
-            print("CuPy RawKernel + NCCL convergence used to stop   : no")
-        print(f"CuPy RawKernel + NCCL final relative update norm : {rel_update_norm:.6e}")
-        print(f"CuPy RawKernel + NCCL CUDA-event interval [s]    : {elapsed_cuda_event:.6f}")
-        print(f"CuPy RawKernel + NCCL wall elapsed time [s]      : {elapsed_wall:.6f}")
-        print(f"CuPy RawKernel + NCCL CUDA-event time/iter [ms]  : {1000.0 * elapsed_cuda_event / max(niters, 1):.6f}")
-        print(f"CuPy RawKernel + NCCL wall time/iter [ms]        : {1000.0 * elapsed_wall / max(niters, 1):.6f}")
-        print(f"CuPy RawKernel + NCCL CUDA-event GUpdates/s      : {gupdates_per_second_cuda_event:.6f}")
-        print(f"CuPy RawKernel + NCCL wall GUpdates/s            : {gupdates_per_second_wall:.6f}")
+            print("CuPy RawKernel + NCCL convergence used to stop                : no")
+        print(f"CuPy RawKernel + NCCL final relative iterate-update norm      : {rel_update_norm:.6e}")
+        print(f"CuPy RawKernel + NCCL CUDA-event interval [s]                 : {elapsed_cuda_event:.6f}")
+        print(f"CuPy RawKernel + NCCL wall elapsed time [s]                   : {elapsed_wall:.6f}")
+        print(f"CuPy RawKernel + NCCL CUDA-event time/iter [ms]               : {1000.0 * elapsed_cuda_event / max(niters, 1):.6f}")
+        print(f"CuPy RawKernel + NCCL wall time/iter [ms]                     : {1000.0 * elapsed_wall / max(niters, 1):.6f}")
+        print("Throughput metric: effective monitored distributed solver")
+        print(f"CuPy RawKernel + NCCL CUDA-event throughput [GCell-updates/s] : {gupdates_per_second_cuda_event:.6f}")
+        print(f"CuPy RawKernel + NCCL wall throughput [GCell-updates/s]       : {gupdates_per_second_wall:.6f}")
     if args.output is not None:
         try:
             solver.write_parallel_hdf5(args.output, niters=niters, rel_update_norm=rel_update_norm,)
@@ -968,7 +957,7 @@ def main():
             print(f"rank {rank}: parallel HDF5 output failed: {exc}", flush=True,)
             mpi_comm.Abort(1)
         if rank == 0:
-            print(f"CuPy RawKernel + NCCL wrote solution           : {args.output}", flush=True,)
+            print(f"CuPy RawKernel + NCCL wrote solution                          : {args.output}", flush=True,)
     if rank == 0:
         print("", flush=True)
     try:

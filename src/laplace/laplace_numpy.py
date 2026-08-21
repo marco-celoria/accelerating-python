@@ -120,6 +120,12 @@ class Laplace2DNumPy:
 
     # Relative update norm
     def compute_relative_l2_update_norm(self):
+        """
+        Compute the relative L2 iterate-update norm:
+            ||u_new - u||_2 / ||u_new||_2
+        over the physical interior.
+        This convergence indicator is not the discrete Laplace residual.
+        """
         diff = self.unew[1:-1, 1:-1] - self.u[1:-1, 1:-1]
         interior = self.unew[1:-1, 1:-1]
         diff2 = np.sum(diff * diff)
@@ -172,7 +178,8 @@ class Laplace2DNumPy:
             dset.attrs["dx"] = self.dx
             dset.attrs["dy"] = self.dy
             dset.attrs["dtype"] = str(self.u.dtype)
-
+            dset.attrs["decomposition"] = "serial/global array"
+            dset.attrs["convergence_metric"] = ("relative L2 iterate-update norm over physical interior")
 
 # CLI
 def parse_args():
@@ -191,7 +198,8 @@ def parse_args():
     parser.add_argument("--bc-bottom", type=float, default=0.0)
     parser.add_argument("--bc-top", type=float, default=0.0)
     parser.add_argument("--fixed-iters", type=int, default=None,
-        help="Run exactly this many iterations, ignoring tolerance.",
+        help=("Run exactly this many iterations without tolerance-based termination. "
+              "The update norm is still evaluated according to --check-every."),
     )
     parser.add_argument("--output", type=str, default=None,
         help="Optional HDF5 filename for NumPy reference solution.",
@@ -229,7 +237,8 @@ def main():
     print(f"  physical size     : ly={args.ly}, lx={args.lx}")
     print(f"  check every       : {args.check_every}")
     print(f"  memory per field  : {bytes_per_array / 1024**2:.2f} MiB")
-    print(f"  memory total      : {2 * bytes_per_array / 1024**2:.2f} MiB")
+    print(f"  persistent fields : {2 * bytes_per_array / 1024**2:.2f} MiB")
+    print("  temporary memory  : NumPy-expression dependent")
     print(f"  output            : {args.output}")
     if args.fixed_iters is not None:
         print(f"  mode              : fixed iteration")
@@ -267,22 +276,28 @@ def main():
     converged = (args.fixed_iters is None and rel_update_norm < args.tol)
     global_updates_per_iter = (args.nx - 2) * (args.ny - 2)
     gupdates_per_second = (global_updates_per_iter * niters / elapsed / 1.0e9 if elapsed > 0.0 else float("inf"))
+    
+    if args.fixed_iters is None and not converged:
+        print("Warning: maximum iteration count reached before the requested tolerance was satisfied.")
+
     print()
     print("============================================================")
     print("Solver summary")
     print("============================================================")
-    print(f"NumPy iterations                     : {niters}")
+    print("Implementation                           : NumPy vectorized") 
+    print(f"NumPy iterations                         : {niters}")
     if args.fixed_iters is None:
-        print(f"NumPy converged                      : {converged}")
+        print(f"NumPy converged                          : {converged}")
     else:
-        print("NumPy converged                      : not evaluated in fixed-iteration mode")
-    print(f"NumPy final relative update norm     : {rel_update_norm:.6e}")
-    print(f"NumPy elapsed time [s]               : {elapsed:.6f}")
-    print(f"NumPy time per iter [ms]             : {1000.0 * elapsed / max(niters, 1):.6f}")
-    print(f"NumPy Jacobi throughput [GUpdates/s] : {gupdates_per_second:.6f}")
+        print("NumPy tolerance-based termination        : disabled")
+    print(f"NumPy final relative iterate-update norm : {rel_update_norm:.6e}")
+    print(f"NumPy elapsed time [s]                   : {elapsed:.6f}")
+    print(f"NumPy time per iter [ms]                 : {1000.0 * elapsed / max(niters, 1):.6f}")
+    print("Throughput metric: effective monitored solver")
+    print(f"NumPy throughput [GCell-updates/s]       : {gupdates_per_second:.6f}")
     if args.output is not None:
         solver.write_hdf5(args.output, niters, rel_update_norm)
-        print(f"NumPy wrote solution                 : {args.output}")
+        print(f"NumPy wrote solution                     : {args.output}")
     print("", flush=True)
 
         

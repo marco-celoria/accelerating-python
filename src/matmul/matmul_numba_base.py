@@ -57,7 +57,9 @@ def matmul_base_float32(A, B, C):
     B shape: l x m
     C shape: n x m
 
-    No shared memory is used.
+    Naive one-thread-per-output-element matrix multiplication.
+    Each thread computes one complete C[row, col] dot product directly from global memory. 
+    No shared-memory tiling is used.
     """
     col = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
     row = cuda.blockIdx.y * cuda.blockDim.y + cuda.threadIdx.y
@@ -82,7 +84,9 @@ def matmul_base_float64(A, B, C):
     B shape: l x m
     C shape: n x m
 
-    No shared memory is used.
+    Naive one-thread-per-output-element matrix multiplication.
+    Each thread computes one complete C[row, col] dot product directly from global memory.
+    No shared-memory tiling is used.
     """
     col = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
     row = cuda.blockIdx.y * cuda.blockDim.y + cuda.threadIdx.y
@@ -165,20 +169,21 @@ def compute_launch_geometry(a, b, tpb_x: int, tpb_y: int):
 
 def flop_count_matmul(n: int, l: int, m: int) -> float:
     """
-    Operation count for naive matrix multiplication:
+    Return the conventional GEMM count, 2*n*l*m FLOPs.
 
-        C[n,m] = A[n,l] @ B[l,m]
-
-    Per C element:
-        l multiplications + (l - 1) additions = 2*l - 1 FLOPs
-
-    Total:
-        n * m * (2*l - 1)
+    Each multiply-add is counted as two floating-point operations.
     """
-    return float(n) * float(m) * float(2 * l - 1)
+    return 2.0 * float(n) * float(l) * float(m)
 
 
 def dtype_tolerances(dtype: np.dtype):
+    """
+    Return pragmatic validation tolerances for this benchmark.
+
+    These values are not formal forward-error bounds. Appropriate
+    tolerances can depend on the inner dimension, input scaling,
+    accumulation order, implementation, and GPU math mode.
+    """
     dtype = np.dtype(dtype)
 
     if dtype == np.dtype(np.float32):
@@ -404,36 +409,45 @@ def matmul(
 
     flops = flop_count_matmul(n, l, m)
     gflops = flops * 1.0e-9
+    
+    if gpu_median <= 0.0:
+        raise RuntimeError("GPU median time is not positive; increase the workload or time multiple launches per sample.")
+    if cpu_median <= 0.0:
+        raise RuntimeError("CPU median time is not positive.")
 
     gpu_gflops_s = gflops / gpu_median
     cpu_gflops_s = gflops / cpu_median
     speedup = cpu_median / gpu_median
-
+    # NumPy matmul may use a multithreaded optimized BLAS implementation. 
+    # Consequently, the reported speedup depends on the CPU, BLAS library, and thread configuration.
     print()
     print("============================================================")
     print("Benchmark summary")
     print("============================================================")
-    print("Timing scope:         compute only")
-    print("GPU timing method:    CUDA events")
-    print("CPU timing method:    perf_counter")
-    print("Transfers included:   no")
-    print("JIT included:         no")
-    print(f"Matrix shapes:        A={a_d.shape}, B={b_d.shape}, C={c_d.shape}")
-    print(f"dtype:                {np.dtype(dtype)}")
-    print(f"iterations:           {iters}")
-    print(f"Exact scalar FLOPs:   {flops:.0f}")
-    print(f"GPU elapsed mean:     {gpu_mean:.6e} s")
-    print(f"GPU elapsed median:   {gpu_median:.6e} s")
-    print(f"GPU elapsed minimum:  {gpu_min:.6e} s")
-    print(f"GPU elapsed stddev:   {gpu_std:.6e} s")
-    print(f"CPU elapsed mean:     {cpu_mean:.6e} s")
-    print(f"CPU elapsed median:   {cpu_median:.6e} s")
-    print(f"CPU elapsed minimum:  {cpu_min:.6e} s")
-    print(f"CPU elapsed stddev:   {cpu_std:.6e} s")
-    print(f"Compute-only speedup: {speedup:.2f}x")
-    print(f"GPU GFLOP/s median:   {gpu_gflops_s:.4f}")
-    print(f"CPU GFLOP/s median:   {cpu_gflops_s:.4f}")
-    print(f"Check passed:         {check_passed}")
+    print("Implementation:               Numba CUDA naive kernel")
+    print("Timing scope:                 compute only")
+    print("GPU timing method:            CUDA events")
+    print("CPU timing method:            perf_counter")
+    print("Transfers included:           no")
+    print("JIT included:                 no")
+    print("CPU comparison:               NumPy matmul; BLAS and thread dependent")
+    print(f"Matrix shapes:                A={a_d.shape}, B={b_d.shape}, C={c_d.shape}")
+    print(f"dtype:                        {np.dtype(dtype)}")
+    print(f"iterations:                   {iters}")
+    print(f"Conventional GEMM FLOPs:      {flops:.0f}")
+    print(f"GPU elapsed mean:             {gpu_mean:.6e} s")
+    print(f"GPU elapsed median:           {gpu_median:.6e} s")
+    print(f"GPU elapsed minimum:          {gpu_min:.6e} s")
+    print(f"GPU elapsed stddev:           {gpu_std:.6e} s")
+    print(f"CPU elapsed mean:             {cpu_mean:.6e} s")
+    print(f"CPU elapsed median:           {cpu_median:.6e} s")
+    print(f"CPU elapsed minimum:          {cpu_min:.6e} s")
+    print(f"CPU elapsed stddev:           {cpu_std:.6e} s")
+    print(f"NumPy/GPU compute-time ratio: {speedup:.2f}x")
+    print(f"GPU GFLOP/s median:           {gpu_gflops_s:.4f}")
+    print(f"CPU GFLOP/s median:           {cpu_gflops_s:.4f}")
+    print(f"Check passed:                 {check_passed}")
+    print("Correctness is checked against NumPy using the same input dtype.")
     return check_passed
 
 # ============================================================
@@ -452,7 +466,7 @@ def main() -> int:
         "n",
         nargs="?",
         type=int,
-        default=99,
+        default=1000,
         help="Rows of A and C",
     )
 
@@ -460,7 +474,7 @@ def main() -> int:
         "m",
         nargs="?",
         type=int,
-        default=123,
+        default=1000,
         help="Columns of B and C",
     )
 
@@ -468,7 +482,7 @@ def main() -> int:
         "l",
         nargs="?",
         type=int,
-        default=78,
+        default=1000,
         help="Columns of A / rows of B",
     )
 
@@ -479,12 +493,13 @@ def main() -> int:
         default=10,
         help="Number of benchmark iterations",
     )
-
+    # FP64 throughput is highly GPU-dependent. 
+    # Consumer and visualization GPUs may have much lower FP64 throughput than datacenter HPC GPUs.
     parser.add_argument(
         "--dtype",
         choices=("float32", "float64"),
         default="float64",
-        help="Floating-point precision",
+        help=("Floating-point precision. FP64 throughput is strongly GPU-dependent and may be much lower on non-HPC GPUs."),
     )
 
     parser.add_argument(

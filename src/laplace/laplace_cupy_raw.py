@@ -150,6 +150,10 @@ class Laplace2DCuPyRawKernel:
         self.rel_update_norm_threads = 256
         if self.rel_update_norm_threads & (self.rel_update_norm_threads - 1) != 0:
             raise ValueError("rel_update_norm_threads must be a power of two")
+        
+        # Cap the number of partial sums. 
+        # The grid-stride loop still processes every interior point.
+        # The value 4096 is a heuristic.
         self.rel_update_norm_blocks = min(4096, (self.n_interior + self.rel_update_norm_threads - 1) // self.rel_update_norm_threads,)
         self.rel_update_norm_shared_bytes = (2 * self.rel_update_norm_threads * cp.dtype(cp.float64).itemsize)
         self.jacobi_threads = (32, 8)
@@ -349,6 +353,9 @@ class Laplace2DCuPyRawKernel:
                 dset.attrs["niters"] = niters
                 dset.attrs["rel_update_norm"] = float(rel_update_norm)
                 dset.attrs["dtype"] = str(self.u.dtype)
+                dset.attrs["decomposition"] = "serial/global array"
+                dset.attrs["convergence_metric"] = ("relative L2 iterate-update norm over physical interior")
+                dset.attrs["rel_update_norm_method"] = ("CUDA partial reduction + CuPy reduction")
 
 # CLI
 def parse_args():
@@ -367,7 +374,8 @@ def parse_args():
     parser.add_argument("--bc-bottom", type=float, default=0.0)
     parser.add_argument("--bc-top", type=float, default=0.0)
     parser.add_argument("--fixed-iters", type=int, default=None,
-        help="Run exactly this many iterations, ignoring tolerance.",
+            help=("Run exactly this many iterations without tolerance-based termination. "
+                  "The update norm is still evaluated according to --check-every."),
     )
     parser.add_argument("--device", type=int, default=0,
         help="CUDA device id.",
@@ -412,24 +420,7 @@ def main():
     props = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id)
     raw_name = props["name"]
     name = raw_name.decode() if isinstance(raw_name, bytes) else str(raw_name)
-    bytes_per_array = args.ny * args.nx * cp.dtype(cp.float64).itemsize
-    print("Serial CuPy RawKernel Laplace solver")
-    print(f"  CUDA device       : {args.device}")
-    print(f"  grid              : ny={args.ny}, nx={args.nx}")
-    print(f"  physical size     : ly={args.ly}, lx={args.lx}")
-    print(f"  check every       : {args.check_every}")
-    print(f"  GPU device name   : {name}")
-    print(f"  memory per field  : {bytes_per_array / 1024**2:.2f} MiB")
-    print(f"  memory total      : {2 * bytes_per_array / 1024**2:.2f} MiB")
-    print(f"  output            : {args.output}")
-    if args.fixed_iters is not None:
-        print(f"  mode              : fixed iteration")
-        print(f"  fixed iterations  : {args.fixed_iters}")
-    else:
-        print(f"  mode              : tolerance")
-        print(f"  tolerance         : {args.tol}")
-        print(f"  max iterations    : {args.max_iters}")
-    print("", flush=True)
+    
     solver = Laplace2DCuPyRawKernel(
         nx=args.nx,
         ny=args.ny,
@@ -440,6 +431,31 @@ def main():
         bc_bottom=args.bc_bottom,
         bc_top=args.bc_top,
     )
+    
+    bytes_per_array = args.ny * args.nx * cp.dtype(cp.float64).itemsize
+    partial_bytes = (2 * solver.rel_update_norm_blocks * np.dtype(np.float64).itemsize)
+    persistent_field_bytes = 2 * bytes_per_array
+    explicit_device_bytes = persistent_field_bytes + partial_bytes
+    
+    print("Serial CuPy RawKernel Laplace solver")
+    print(f"  CUDA device        : {args.device}")
+    print(f"  grid               : ny={args.ny}, nx={args.nx}")
+    print(f"  physical size      : ly={args.ly}, lx={args.lx}")
+    print(f"  check every        : {args.check_every}")
+    print(f"  GPU device name    : {name}")
+    print(f"  memory per field   : {bytes_per_array / 1024**2:.2f} MiB")
+    print(f"  persistent fields  : {persistent_field_bytes / 1024**2:.2f} MiB")
+    print(f"  reduction partials : {partial_bytes / 1024**2:.2f} MiB")
+    print(f"  explicit total     : {explicit_device_bytes / 1024**2:.2f} MiB")
+    print(f"  output             : {args.output}")
+    if args.fixed_iters is not None:
+        print(f"  mode               : fixed iteration")
+        print(f"  fixed iterations   : {args.fixed_iters}")
+    else:
+        print(f"  mode               : tolerance")
+        print(f"  tolerance          : {args.tol}")
+        print(f"  max iterations     : {args.max_iters}")
+    print("", flush=True)
 
     print("Warming up...", flush=True)
     solver.warmup()
@@ -457,25 +473,29 @@ def main():
     gupdates_per_second_cuda_event = (total_updates / elapsed_cuda_event / 1.0e9 if elapsed_cuda_event > 0.0 else float("inf"))
     gupdates_per_second_wall       = (total_updates / elapsed_wall       / 1.0e9 if elapsed_wall       > 0.0 else float("inf"))
     converged = (args.fixed_iters is None and rel_update_norm < args.tol)
+    if args.fixed_iters is None and not converged:
+        print("Warning: maximum iteration count reached before the requested tolerance was satisfied.", flush=True,)
     print()
     print("============================================================")
     print("Solver summary")
     print("============================================================")
-    print(f"CuPy RawKernel iterations                         : {niters}")
+    print("Implementation                                         : CuPy RawKernel fused Jacobi kernel")
+    print(f"CuPy RawKernel iterations                              : {niters}")
     if args.fixed_iters is None:
-        print(f"CuPy RawKernel converged                          : {converged}")
+        print(f"CuPy RawKernel converged                               : {converged}")
     else:
-        print("CuPy RawKernel convergence used for stopping      : no")
-    print(f"CuPy RawKernel final relative update norm         : {rel_update_norm:.6e}")
-    print(f"CuPy RawKernel CUDA-event solver interval [s]     : {elapsed_cuda_event:.6f}")
-    print(f"CuPy RawKernel wall elapsed time [s]              : {elapsed_wall:.6f}")
-    print(f"CuPy RawKernel CUDA-event time per iter [ms]      : {1000.0 * elapsed_cuda_event / max(niters, 1):.6f}")
-    print(f"CuPy RawKernel wall time per iter [ms]            : {1000.0 * elapsed_wall / max(niters, 1):.6f}")
-    print(f"CuPy RawKernel CUDA-event throughput [GUpdates/s] : {gupdates_per_second_cuda_event:.6f}")
-    print(f"CuPy RawKernel wall throughput [GUpdates/s]       : {gupdates_per_second_wall:.6f}")
+        print("CuPy RawKernel convergence used for stopping           : no")
+    print(f"CuPy RawKernel final relative iterate-update norm      : {rel_update_norm:.6e}")
+    print(f"CuPy RawKernel CUDA-event solver interval [s]          : {elapsed_cuda_event:.6f}")
+    print(f"CuPy RawKernel wall elapsed time [s]                   : {elapsed_wall:.6f}")
+    print(f"CuPy RawKernel CUDA-event time per iter [ms]           : {1000.0 * elapsed_cuda_event / max(niters, 1):.6f}")
+    print(f"CuPy RawKernel wall time per iter [ms]                 : {1000.0 * elapsed_wall / max(niters, 1):.6f}")
+    print("Throughput metric: effective monitored solver")
+    print(f"CuPy RawKernel CUDA-event throughput [GCell-updates/s] : {gupdates_per_second_cuda_event:.6f}")
+    print(f"CuPy RawKernel wall throughput [GCell-updates/s]       : {gupdates_per_second_wall:.6f}")
     if args.output is not None:
         solver.write_hdf5(args.output, niters, rel_update_norm)
-        print(f"CuPy RawKernel wrote solution                     : {args.output}")
+        print(f"CuPy RawKernel wrote solution                          : {args.output}")
     print("", flush=True)
 
 

@@ -435,8 +435,10 @@ class Laplace2DDistributedCUDAAwareMPI:
 
     def compute_relative_l2_update_norm(self):
         """
-        Compute global relative L2 update norm:
+        Compute the global relative L2 iterate-update norm:
             ||u_new - u||_2 / ||u_new||_2
+        over the global physical interior.
+        This convergence indicator is not the discrete Laplace residual.
         Local part uses the same RawKernel partial-reduction scheme
         as the serial CuPy RawKernel implementation.
         Global reduction uses CUDA-aware MPI Allreduce on a 2-element CuPy buffer.
@@ -506,7 +508,6 @@ class Laplace2DDistributedCUDAAwareMPI:
             stop.record()
             stop.synchronize()
             elapsed_cuda_local = cp.cuda.get_elapsed_time(start, stop) / 1000.0
-            self.mpi_comm.Barrier()
             elapsed_wall_local = MPI.Wtime() - wall_t0
             elapsed_cuda_max = self.mpi_comm.allreduce(elapsed_cuda_local, op=MPI.MAX)
             elapsed_wall_max = self.mpi_comm.allreduce(elapsed_wall_local, op=MPI.MAX)
@@ -551,7 +552,9 @@ class Laplace2DDistributedCUDAAwareMPI:
                 dset.attrs["solver"] = "Jacobi"
                 dset.attrs["backend"] = "CuPy RawKernel + CUDA-aware MPI + mpi4py"
                 dset.attrs["decomposition"] = "1D row decomposition"
-                dset.attrs["communication"] = "CUDA-aware MPI Sendrecv halos"
+                dset.attrs["communication"] = ("CUDA-aware MPI Sendrecv halos; CUDA-aware MPI Allreduce for iterate-update norm")
+                dset.attrs["convergence_metric"] = ("relative L2 iterate-update norm over global physical interior")
+                dset.attrs["rel_update_norm_method"] = ("CUDA partial reduction + CuPy reduction + CUDA-aware MPI Allreduce")
                 if niters is not None:
                     dset.attrs["niters"] = niters
                 if rel_update_norm is not None:
@@ -578,7 +581,8 @@ def parse_args():
     parser.add_argument("--bc-top", type=float, default=0.0)
     parser.add_argument("--output", type=str, default=None, help="Optional parallel HDF5 output filename.",)
     parser.add_argument("--fixed-iters", type=int, default=None,
-        help="Run exactly this many iterations, ignoring tolerance.",
+        help=("Run exactly this many iterations without tolerance-based termination. "
+              "The update norm is still evaluated according to --check-every."),
     )
     return parser.parse_args()
 
@@ -657,13 +661,13 @@ def main():
         print(f"rank {rank}: no visible CUDA devices", flush=True,)
         mpi_comm.Abort(1)
 
-    if local_rank >= ndev:
-        print(f"rank {rank}: local_rank={local_rank} is out of range; visible CUDA devices on this node: {ndev}. "
-               "Use one MPI rank per GPU or explicitly allow oversubscription.", flush=True,)
-        mpi_comm.Abort(1)
 
+    device_id = 0 if ndev == 1 else local_rank
+    if device_id >= ndev:
+        print(f"rank {rank}: cannot map local_rank={local_rank} to {ndev} visible GPU(s)", flush=True,)
+        mpi_comm.Abort(1)
     try:
-        cp.cuda.Device(local_rank).use()
+        cp.cuda.Device(device_id).use()
         solver = Laplace2DDistributedCUDAAwareMPI(
             nx=args.nx,
             ny=args.ny,
@@ -714,6 +718,7 @@ def main():
             f"gpu={gpu_name} | "
             f"global rows [{solver.ystart}:{solver.yend}) | "
             f"local_ny={solver.local_ny} | "
+            f"update_rows={solver.update_i1 - solver.update_i0} | "
             f"local array={solver.u.shape} | "
             f"memory/field={local_field_bytes / 1024**2:.2f} MiB | "
             f"explicit_device={explicit_local_device_bytes / 1024**2:.2f} MiB"
@@ -748,6 +753,9 @@ def main():
         mpi_comm.Abort(1)
     
     converged = (args.fixed_iters is None and rel_update_norm < args.tol)
+    if rank == 0 and args.fixed_iters is None and not converged:
+        print("Warning: maximum iteration count reached before the requested tolerance was satisfied.", flush=True,)
+    
     global_updates_per_iter = ((args.nx - 2) * (args.ny - 2))
     total_updates = global_updates_per_iter * niters
     gupdates_per_second_cuda_event = (total_updates / elapsed_cuda_event / 1.0e9 if elapsed_cuda_event > 0.0 else float("inf"))
@@ -758,19 +766,21 @@ def main():
         print("============================================================", flush=True)
         print("Solver summary", flush=True)
         print("============================================================", flush=True)
-        print(f"CuPy RawKernel + MPI iterations                  : {niters}", flush=True)
+        print("Implementation                                               : CuPy RawKernel fused Jacobi + CUDA-aware MPI")
+        print(f"CuPy RawKernel + MPI iterations                              : {niters}", flush=True)
         if args.fixed_iters is None:
-            print(f"CuPy RawKernel + MPI converged                   : {converged}", flush=True,)
+            print(f"CuPy RawKernel + MPI converged                               : {converged}", flush=True,)
         else:
-            print( "CuPy RawKernel + MPI convergence used            : no", flush=True,)
+            print("CuPy RawKernel + MPI convergence used                        : no", flush=True,)
 
-        print(f"CuPy RawKernel + MPI final relative update norm  : {rel_update_norm:.6e}", flush=True,)
-        print(f"CuPy RawKernel + MPI CUDA-event interval [s]     : {elapsed_cuda_event:.6f}", flush=True)
-        print(f"CuPy RawKernel + MPI wall elapsed time [s]       : {elapsed_wall:.6f}", flush=True)
-        print(f"CuPy RawKernel + MPI CUDA-event time/iter [ms]   : {1000.0 * elapsed_cuda_event / max(niters, 1):.6f}", flush=True,)
-        print(f"CuPy RawKernel + MPI wall time/iter [ms]         : {1000.0 * elapsed_wall / max(niters, 1):.6f}", flush=True,)
-        print(f"CuPy RawKernel + MPI CUDA-event GUpdates/s       : {gupdates_per_second_cuda_event:.6f}", flush=True)
-        print(f"CuPy RawKernel + MPI wall GUpdates/s             : {gupdates_per_second_wall:.6f}", flush=True)
+        print(f"CuPy RawKernel + MPI final relative iterate-update norm      : {rel_update_norm:.6e}", flush=True,)
+        print(f"CuPy RawKernel + MPI CUDA-event interval [s]                 : {elapsed_cuda_event:.6f}", flush=True)
+        print(f"CuPy RawKernel + MPI wall elapsed time [s]                   : {elapsed_wall:.6f}", flush=True)
+        print(f"CuPy RawKernel + MPI CUDA-event time/iter [ms]               : {1000.0 * elapsed_cuda_event / max(niters, 1):.6f}", flush=True,)
+        print(f"CuPy RawKernel + MPI wall time/iter [ms]                     : {1000.0 * elapsed_wall / max(niters, 1):.6f}", flush=True,)
+        print("Throughput metric: effective monitored distributed solver")
+        print(f"CuPy RawKernel + MPI CUDA-event throughput [GCell-updates/s] : {gupdates_per_second_cuda_event:.6f}")
+        print(f"CuPy RawKernel + MPI wall throughput [GCell-updates/s]       : {gupdates_per_second_wall:.6f}")
     if args.output is not None:
         try:
             solver.write_parallel_hdf5(args.output, niters, rel_update_norm,)
@@ -778,7 +788,7 @@ def main():
             print(f"rank {rank}: parallel HDF5 output failed: {exc}", flush=True,)
             mpi_comm.Abort(1)
         if rank == 0:
-            print(f"CuPy RawKernel + MPI wrote solution             : {args.output}", flush=True)
+            print(f"CuPy RawKernel + MPI wrote solution                          : {args.output}", flush=True)
             print("", flush=True)
 
 

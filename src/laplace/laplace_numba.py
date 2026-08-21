@@ -35,7 +35,8 @@ def nvtx_range(name: str, id_color: int = -1):
             except Exception:
                 pass
 
-
+# A full warp spans x, the contiguous row-major dimension.
+# The 32 x 8 block contains 256 threads.
 TPB_X = 32
 TPB_Y = 8
 REDUCE_TPB = 256
@@ -139,6 +140,9 @@ class Laplace2DNumbaCUDA:
         self.n_interior = ((self.ny - 2) * (self.nx - 2))
         self.norm_blocks = (self.n_interior + REDUCE_TPB - 1) // REDUCE_TPB
         self._validate_kernel_configuration()
+        # Educational map-plus-reduce implementation.
+        # It materializes two FP64 values per interior point, 
+        # so the explicit norm workspace scales with the local problem size.
         self.d_diff_sq = cuda.device_array(self.n_interior, dtype=np.float64)
         self.d_norm_sq = cuda.device_array(self.n_interior, dtype=np.float64)
 
@@ -240,9 +244,13 @@ class Laplace2DNumbaCUDA:
     # Relative update norm
     def compute_relative_l2_update_norm(self):
         """
-        Compute relative L2 update norm:
+        Compute the relative L2 iterate-update norm:
+
             ||u_new - u||_2 / ||u_new||_2
-        over true global interior points only.
+
+        over the physical interior.
+
+        This convergence indicator is not the discrete Laplace residual.
         """
         with nvtx_range("jacobi_l2", id_color=3):
             rel_update_norm_map_kernel[self.norm_blocks, REDUCE_TPB](
@@ -325,6 +333,9 @@ class Laplace2DNumbaCUDA:
                 dset.attrs["niters"] = niters
                 dset.attrs["rel_update_norm"] = float(rel_update_norm)
                 dset.attrs["dtype"] = str(host_u.dtype)
+                dset.attrs["rel_update_norm_method"] = ("Numba CUDA map kernel + cuda.reduce")
+                dset.attrs["decomposition"] = "serial/global array"
+                dset.attrs["convergence_metric"] = ("relative L2 iterate-update norm over physical interior")
 
 # CLI
 def parse_args():
@@ -343,7 +354,8 @@ def parse_args():
     parser.add_argument("--bc-bottom", type=float, default=0.0)
     parser.add_argument("--bc-top", type=float, default=0.0)
     parser.add_argument("--fixed-iters", type=int, default=None,
-        help="Run exactly this many iterations, ignoring tolerance.",
+        help=("Run exactly this many iterations without tolerance-based termination. "
+              "The update norm is still evaluated according to --check-every."),
     )
     parser.add_argument("--device", type=int, default=0,
         help="CUDA device id.",
@@ -355,6 +367,8 @@ def parse_args():
 
 
 def validate_common_args(args):
+    if not cuda.is_available():
+        raise RuntimeError("CUDA is not available")
     if args.nx < 3 or args.ny < 3:
         raise ValueError("nx and ny must both be at least 3")
     if not np.isfinite(args.lx) or not np.isfinite(args.ly):
@@ -435,6 +449,8 @@ def main():
     )
     
     converged = (args.fixed_iters is None and rel_update_norm < args.tol)
+    if args.fixed_iters is None and not converged:
+        print("Warning: maximum iteration count reached before the requested tolerance was satisfied.", flush=True,)
     global_updates_per_iter = ((args.nx - 2) * (args.ny - 2))
     total_updates = global_updates_per_iter * niters
     gupdates_per_second_cuda_event = (total_updates / elapsed_cuda_event / 1.0e9 if elapsed_cuda_event > 0.0 else float("inf"))
@@ -443,18 +459,20 @@ def main():
     print("============================================================")
     print("Solver summary")
     print("============================================================")
+    print("Implementation                                : Numba CUDA fused Jacobi kernel") 
     print(f"Numba CUDA iterations                         : {niters}")
     if args.fixed_iters is None:
         print(f"Numba CUDA converged                          : {converged}")
     else:
         print("Numba CUDA convergence used for stopping      : no")
-    print(f"Numba CUDA final relative update norm         : {rel_update_norm:.6e}")
+    print(f"Numba CUDA final relative iterate-update norm : {rel_update_norm:.6e}")
     print(f"Numba CUDA-event solver interval [s]          : {elapsed_cuda_event:.6f}")
     print(f"Numba CUDA wall elapsed time [s]              : {elapsed_wall:.6f}")
     print(f"Numba CUDA-event time per iter [ms]           : {1000.0 * elapsed_cuda_event / max(niters, 1):.6f}")
     print(f"Numba CUDA wall time per iter [ms]            : {1000.0 * elapsed_wall / max(niters, 1):.6f}")
-    print(f"Numba CUDA-event throughput [GUpdates/s]      : {gupdates_per_second_cuda_event:.6f}")
-    print(f"Numba CUDA wall throughput [GUpdates/s]       : {gupdates_per_second_wall:.6f}")
+    print("Throughput metric: effective monitored solver")
+    print(f"Numba CUDA-event throughput [GCell-updates/s] : {gupdates_per_second_cuda_event:.6f}")
+    print(f"Numba wall throughput [GCell-updates/s]       : {gupdates_per_second_wall:.6f}")
     if args.output is not None:
         solver.write_hdf5(args.output, niters, rel_update_norm)
         print(f"Numba CUDA wrote solution                     : {args.output}")

@@ -153,6 +153,8 @@ class Laplace2DCuPy:
             diff2 = cp.sum(diff * diff)
             norm2 = cp.sum(interior * interior)
             rel_update_norm_gpu = cp.sqrt(diff2) / cp.maximum(cp.sqrt(norm2), 1.0e-300)
+            # Copying the scalar to the host synchronizes the GPU stream.
+            # Python needs the host value for tolerance-based control flow.
             return float(rel_update_norm_gpu.get())
 
 
@@ -220,7 +222,9 @@ class Laplace2DCuPy:
                 dset.attrs["dx"] = self.dx
                 dset.attrs["dy"] = self.dy
                 dset.attrs["dtype"] = str(self.u.dtype)
-
+                dset.attrs["decomposition"] = "serial/global array"
+                dset.attrs["convergence_metric"] = ("relative L2 iterate-update norm over physical interior")
+                dset.attrs["rel_update_norm_method"] = ("CuPy vectorized expressions and reductions")
 
 # CLI
 def parse_args():
@@ -240,7 +244,8 @@ def parse_args():
     parser.add_argument("--bc-top", type=float, default=0.0)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--fixed-iters", type=int, default=None,
-        help="Run exactly this many iterations, ignoring tolerance.",
+        help=("Run exactly this many iterations without tolerance-based termination. "
+              "The update norm is still evaluated according to --check-every."),
     )
     parser.add_argument("--output", type=str, default=None,
         help="Optional HDF5 filename.",
@@ -286,9 +291,11 @@ def main():
     print(f"  grid              : ny={args.ny}, nx={args.nx}")
     print(f"  physical size     : ly={args.ly}, lx={args.lx}")
     print(f"  check every       : {args.check_every}")
+    print(f"  GPU device id     : {args.device}")
     print(f"  GPU device name   : {name}")
     print(f"  memory per field  : {bytes_per_array / 1024**2:.2f} MiB")
-    print(f"  memory total      : {2 * bytes_per_array / 1024**2:.2f} MiB")
+    print(f"  persistent fields : {2 * bytes_per_array / 1024**2:.2f} MiB")
+    print("  temporary memory  : CuPy-expression dependent")
     print(f"  output            : {args.output}")
     if args.fixed_iters is not None:
         print(f"  mode              : fixed iteration")
@@ -326,25 +333,29 @@ def main():
     gupdates_per_second_wall = (total_updates / elapsed_wall / 1.0e9 if elapsed_wall > 0.0 else float("inf"))
 
     converged = (args.fixed_iters is None and rel_update_norm < args.tol)
+    if args.fixed_iters is None and not converged:
+        print("Warning: maximum iteration count reached before the requested tolerance was satisfied.", flush=True,)
     print()
     print("============================================================")
     print("Solver summary")
     print("============================================================")
-    print(f"CuPy iterations                         : {niters}")
+    print("Implementation                               : CuPy vectorized")
+    print(f"CuPy iterations                              : {niters}")
     if args.fixed_iters is None:
-        print(f"CuPy converged                          : {converged}")
+        print(f"CuPy converged                               : {converged}")
     else:
-        print("CuPy convergence used for stopping      : no")
-    print(f"CuPy final relative update norm         : {rel_update_norm:.6e}")
-    print(f"CuPy CUDA-event solver interval [s]     : {elapsed_gpu:.6f}")
-    print(f"CuPy wall elapsed time [s]              : {elapsed_wall:.6f}")
-    print(f"CuPy CUDA-event time per iter [ms]      : {1000.0 * elapsed_gpu / max(niters, 1):.6f}")
-    print(f"CuPy wall time per iter [ms]            : {1000.0 * elapsed_wall / max(niters, 1):.6f}")
-    print(f"CuPy CUDA-event throughput [GUpdates/s] : {gupdates_per_second_gpu:.6f}")
-    print(f"CuPy wall throughput [GUpdates/s]       : {gupdates_per_second_wall:.6f}")
+        print("CuPy convergence used for stopping           : no")
+    print(f"CuPy final relative iterate-update norm      : {rel_update_norm:.6e}")
+    print(f"CuPy CUDA-event solver interval [s]          : {elapsed_gpu:.6f}")
+    print(f"CuPy wall elapsed time [s]                   : {elapsed_wall:.6f}")
+    print(f"CuPy CUDA-event time per iter [ms]           : {1000.0 * elapsed_gpu / max(niters, 1):.6f}")
+    print(f"CuPy wall time per iter [ms]                 : {1000.0 * elapsed_wall / max(niters, 1):.6f}")
+    print("Throughput metric: effective monitored solver")
+    print(f"CuPy CUDA-event throughput [GCell-updates/s] : {gupdates_per_second_gpu:.6f}")
+    print(f"CuPy wall throughput [GCell-updates/s]       : {gupdates_per_second_wall:.6f}")
     if args.output is not None:
         solver.write_hdf5(args.output, niters, rel_update_norm)
-        print(f"CuPy wrote solution                     : {args.output}")
+        print(f"CuPy wrote solution                          : {args.output}")
     print("", flush=True)
 
 

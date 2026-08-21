@@ -6,7 +6,7 @@
 #SBATCH --time=0:30:00
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH --job-name=run_matmul_cupy_at_prof
+#SBATCH --job-name=run_matmul_cupy_builtin_prof
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
 #SBATCH --gres=gpu:1
@@ -28,12 +28,12 @@ cd ..
 source pygpu_venv/bin/activate
 cd -
 
-mkdir -p reports_cupy_at_${SLURM_JOB_ID}
+mkdir -p reports_cupy_builtin_${SLURM_JOB_ID}
 
-nsys profile --trace=cuda,cublas,nvtx,osrt  -o nsys_prof_matmul_cupy_at.%p python matmul_cupy_at.py 10000 10000 10000 10
+nsys profile --trace=cuda,cublas,nvtx,osrt  -o nsys_prof_matmul_cupy_builtin.%p python matmul_cupy_builtin.py 10000 10000 10000 10
 
-ncu --set full --section SpeedOfLight_HierarchicalTensorRooflineChart -o ncu_prof_matmul_cupy_at.%p python matmul_cupy_at.py 10000 10000 10000 1
+ncu --set full --section SpeedOfLight_HierarchicalTensorRooflineChart -o ncu_prof_matmul_cupy_builtin.%p python matmul_cupy_builtin.py 10000 10000 10000 1
 
-mv  ncu_prof_matmul_cupy_at*.ncu-rep  reports_cupy_at_${SLURM_JOB_ID}
-mv nsys_prof_matmul_cupy_at*.nsys-rep reports_cupy_at_${SLURM_JOB_ID}
+mv  ncu_prof_matmul_cupy_builtin*.ncu-rep  reports_cupy_builtin_${SLURM_JOB_ID}
+mv nsys_prof_matmul_cupy_builtin*.nsys-rep reports_cupy_builtin_${SLURM_JOB_ID}
 
