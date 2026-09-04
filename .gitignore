@@ -1,0 +1,11 @@
+# Job execution and error logs (e.g., SLURM outputs)
+**.err
+**.out
+
+# HDF5 data files
+**.h5
+
+**.ipynb_checkpoints
+**.ncu-rep
+**.nsys-rep
+**.sqlite
