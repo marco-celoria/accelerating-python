@@ -2,49 +2,32 @@ import numpy as np
 from numba import cuda
 
 @cuda.jit
-def add_2d(a, b, c):
-    col, row = cuda.grid(2)
-    if row < a.shape[0] and col < a.shape[1]:
-        c[row, col] = a[row, col] + b[row, col]
-        
+def add_grid_stride(d_a, d_b, d_c):
+    start = cuda.grid(1)
+    stride = cuda.gridsize(1)
+    for i in range(start, d_c.size, stride):
+        d_c[i] = d_a[i] + d_b[i]
 
-# Initialize the input arrays in host memory.
-rows = 1000
-cols = 2000
-h_a = np.full((rows, cols), 1.5, dtype=np.float32)
-h_b = np.full((rows, cols), 2.5, dtype=np.float32)
-# Allocate device memory and transfer the input arrays.
-d_a = cuda.to_device(h_a)
-d_b = cuda.to_device(h_b)
-d_c = cuda.device_array_like(d_a)
+# Initialize host arrays.
+n_elements = 10_000_000
+h_x = np.arange(n_elements, dtype=np.float32)
+h_y = np.full(n_elements, 2.0, dtype=np.float32)
 
-# Configure a two-dimensional thread block.
-threads_per_block = (16, 16)
-# Round up the grid dimensions to cover the complete array.
-blocks_per_grid = (
-    (cols + threads_per_block[0] - 1) // threads_per_block[0],
-    (rows + threads_per_block[1] - 1) // threads_per_block[1],
-)
+# Allocate device arrays and transfer the inputs.
+d_x = cuda.to_device(h_x)
+d_y = cuda.to_device(h_y)
+d_z = cuda.device_array_like(d_x)
 
-# Warm up the kernel to trigger compilation and initialization.
-add_2d[blocks_per_grid, threads_per_block](d_a, d_b, d_c)
-cuda.synchronize()
+threads_per_block = 256
+blocks_per_grid = 128
 
-# Measure the cached kernel using CUDA events.
-start_event = cuda.event()
-stop_event  = cuda.event()
-start_event.record()
+# Launch the kernel on the GPU with 256*128=32_768 threads in the grid 
+# for a much larger problem size (32_768 < 10_000_000)
+add_grid_stride[blocks_per_grid, threads_per_block](d_x, d_y, d_z)
 
-add_2d[blocks_per_grid, threads_per_block](d_a, d_b, d_c)
+# Wait for completion and copy the result to the host.
+h_z = d_z.copy_to_host()
 
-stop_event.record()
-stop_event.synchronize()
-elapsed_ms = cuda.event_elapsed_time(start_event, stop_event)
-
-# Copy the result back to host memory.
-h_c = d_c.copy_to_host()
-
-# Improved assertion with 2D coordinate diagnostics
-np.testing.assert_allclose(h_c, h_a + h_b, rtol=1.0e-6, atol=1.0e-6)
-print(f"Kernel execution time: {elapsed_ms:.3f} ms")
+# Improved assertion with explicit tolerances
+np.testing.assert_allclose(h_z, h_x + h_y, rtol=1.0e-6, atol=1.0e-6)
 print("Verification passed.")

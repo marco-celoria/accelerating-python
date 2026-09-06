@@ -1,33 +1,65 @@
+import math
 import numpy as np
 from numba import cuda
 
 @cuda.jit
-def add_grid_stride(d_a, d_b, d_c):
-    start = cuda.grid(1)
-    stride = cuda.gridsize(1)
-    for i in range(start, d_c.size, stride):
-        d_c[i] = d_a[i] + d_b[i]
+def scaled_hypot_kernel(a, b, out):
+    i = cuda.grid(1)
+    if i < out.size:
+        out[i] = 0.5 * math.hypot(a[i], b[i])
 
-# Initialize host arrays.
-n_elements = 10_000_000
-h_x = np.arange(n_elements, dtype=np.float32)
-h_y = np.full(n_elements, 2.0, dtype=np.float32)
-
-# Allocate device arrays and transfer the inputs.
-d_x = cuda.to_device(h_x)
-d_y = cuda.to_device(h_y)
-d_z = cuda.device_array_like(d_x)
+n_elements = 1_000_000_000
+n_streams = 4
+chunk_size = (n_elements + n_streams - 1) // n_streams
 
 threads_per_block = 256
-blocks_per_grid = 128
 
-# Launch the kernel on the GPU with 256*128=32_768 threads in the grid 
-# for a much larger problem size (32_768 < 10_000_000)
-add_grid_stride[blocks_per_grid, threads_per_block](d_x, d_y, d_z)
+# Pinned host memory enables asynchronous host-device transfers.
+h_a = cuda.pinned_array(n_elements, dtype=np.float64)
+h_b = cuda.pinned_array(n_elements, dtype=np.float64)
+h_o = cuda.pinned_array(n_elements, dtype=np.float64)
 
-# Wait for completion and copy the result to the host.
-h_z = d_z.copy_to_host()
+rng = np.random.default_rng(12345)
+h_a[:] = rng.standard_normal(n_elements)
+h_b[:] = rng.standard_normal(n_elements)
 
-# Improved assertion with explicit tolerances
-np.testing.assert_allclose(h_z, h_x + h_y, rtol=1.0e-6, atol=1.0e-6)
+# Independent CUDA streams may allow overlap between host-device
+# transfers, kernel execution, and device-host transfers.
+streams = [cuda.stream() for _ in range(n_streams)]
+
+# Keep explicit references to device allocations until all asynchronous
+# operations using them have completed.
+device_buffers = []
+
+for stream_id, stream in enumerate(streams):
+    start = stream_id * chunk_size
+    stop = min(start + chunk_size, n_elements)
+    if start >= stop:
+        continue
+
+    n_chunk = stop - start
+    blocks_per_grid = (n_chunk + threads_per_block - 1) // threads_per_block
+
+    # Enqueue asynchronous host-to-device transfers.
+    d_a = cuda.to_device(h_a[start:stop], stream=stream)
+    d_b = cuda.to_device(h_b[start:stop], stream=stream)
+
+    # Allocate the output in device memory.
+    d_o = cuda.device_array(n_chunk, dtype=np.float64, stream=stream)
+
+    # The kernel launch is asynchronous and ordered after the H2D
+    # transfers because it is submitted to the same stream.
+    scaled_hypot_kernel[blocks_per_grid, threads_per_block, stream](d_a, d_b, d_o)
+
+    # Enqueue an asynchronous device-to-host transfer into the
+    # appropriate slice of the pinned output array.
+    d_o.copy_to_host(ary=h_o[start:stop], stream=stream)
+    device_buffers.append((d_a, d_b, d_o))
+
+# Wait until all operations in every stream have completed.
+for stream in streams:
+    stream.synchronize()
+
+expected = 0.5 * np.hypot(h_a, h_b)
+np.testing.assert_allclose(h_o, expected, rtol=1.0e-12, atol=1.0e-12)
 print("Verification passed.")

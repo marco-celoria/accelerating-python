@@ -1,50 +1,77 @@
-import os
+import numpy as np
 import cupy as cp
 
-fp64_wmma_kernel = cp.RawKernel(
-r'''
-#include <mma.h>
-
-using namespace nvcuda;
-
-extern "C" __global__
-void wmma_fp64(
-    const double* __restrict__ A,
-    const double* __restrict__ B,
-    double* __restrict__ C)
+jacobi_kernel = cp.RawKernel(r'''
+extern "C"
+__global__
+void jacobi_2d(
+    const double* __restrict__ u,
+    double* __restrict__ unew,
+    const size_t n
+)
 {
-    // A single warp (32 threads) computes the 8x8x4 MMA
-    wmma::fragment<wmma::matrix_a, 8, 8, 4, double, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, 8, 8, 4, double, wmma::row_major> b_frag;
-    wmma::fragment<wmma::accumulator, 8, 8, 4, double> c_frag;
+    // Compute 2D global thread indices.
+    // The +1 offset skips the first row/column, which are fixed boundaries.
+    const size_t j = blockDim.x * blockIdx.x + threadIdx.x + 1;
+    const size_t i = blockDim.y * blockIdx.y + threadIdx.y + 1;
+
+    // Exclude the high-index physical boundaries and any padded
+    // thread coordinates beyond the physical interior.
+    if (j >= n - 1 || i >= n - 1) {
+        return;
+    }
     
-    wmma::fill_fragment(c_frag, 0.0);
-    wmma::load_matrix_sync(a_frag, A, 4);
-    wmma::load_matrix_sync(b_frag, B, 8);
-    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-    wmma::store_matrix_sync(C, c_frag, 8, wmma::mem_row_major);
+    // Flatten the 2D coordinates (i, j) into a 1D memory offset.
+    const size_t idx = i * n + j;
+
+    // Gather the four neighboring values (left, right, down, up).
+    const double left  = u[idx - 1];
+    const double right = u[idx + 1];
+    const double down  = u[idx - n];
+    const double up    = u[idx + n];
+
+    // Compute the stencil average and write to the output array.
+    unew[idx] = 0.25 * (left + right + down + up);
 }
-''',
-    "wmma_fp64",
-    options=(
-        "--std=c++17",
-#        f"-I{os.environ['CUDA_HOME']}/include",
-    )
+''', "jacobi_2d", )
+
+n = 1_000
+u = cp.random.random((n, n), dtype=cp.float64)
+left  = u[1:-1, :-2]
+right = u[1:-1, 2:]
+down  = u[:-2, 1:-1]
+up    = u[2:, 1:-1]
+
+# Both output fields are initialized to zero, including their boundaries.
+raw_res  = cp.zeros_like(u)
+cupy_res = cp.zeros_like(u)
+threads = (32, 8)
+
+# Smallest two-dimensional block grid that covers the physical interior.
+blocks  = (
+    (n - 2 + threads[0] - 1) // threads[0],
+    (n - 2 + threads[1] - 1) // threads[1],
 )
 
-# FP64 WMMA uses an 8x8x4 tile configuration.
-M = N = 8
-K = 4
-d_a = cp.random.random((M, K), dtype=cp.float64)
-d_b = cp.random.random((K, N), dtype=cp.float64)
-d_c = cp.zeros((M, N), dtype=cp.float64)
-
-# Launch the kernel with 1 block of 32 threads (one warp)
-fp64_wmma_kernel((1,), (32,), (d_a, d_b, d_c))
+# Warm up the RawKernel to trigger compilation and caching.
+cupy_res[1:-1, 1:-1] = 0.25 * (left + right + down + up)
+jacobi_kernel(blocks, threads, (u, raw_res, np.uint64(n),))
 cp.cuda.get_current_stream().synchronize()
+cupy_res.fill(0.0)
+raw_res.fill(0.0)
 
-# Verify the result against CuPy's high-level matrix multiplication
-d_r = d_a @ d_b
-# Improved assertion
-cp.testing.assert_allclose(d_c, d_r, rtol=1e-12, atol=1e-12)
+# Profile the high-level CuPy array expression.
+cp.cuda.nvtx.RangePush("CuPy array-expression Jacobi iteration")
+cupy_res[1:-1, 1:-1] = 0.25 * (left + right + down + up)
+cp.cuda.get_current_stream().synchronize()
+cp.cuda.nvtx.RangePop()
+
+# Profile the cached custom kernel.
+cp.cuda.nvtx.RangePush("CuPy RawKernel Jacobi iteration")
+jacobi_kernel(blocks, threads, (u, raw_res, np.uint64(n),))
+cp.cuda.get_current_stream().synchronize()
+cp.cuda.nvtx.RangePop()
+
+# Verify the result outside the profiled regions.
+cp.testing.assert_allclose(raw_res, cupy_res, rtol=1.0e-12, atol=1.0e-12)
 print("Verification passed.")

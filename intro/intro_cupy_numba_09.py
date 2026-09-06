@@ -1,26 +1,48 @@
-import numpy as np
+import cupy as cp
 
-def jacobi_point_update(u, unew, i, j, n):
-    # Defensive check retained to mirror the CUDA implementation.
-    # It is redundant for the loop bounds used below.
-    if i <= 0 or i >= n - 1 or j <= 0 or j >= n - 1:
-        return
-    idx = i * n + j
-    left  = u[idx - 1]
-    right = u[idx + 1]
-    down  = u[idx - n]
-    up    = u[idx + n]
-    unew[idx] = 0.25 * (left + right + down + up)
+# Compute c = a + b element by element.
+array_add = cp.ElementwiseKernel(
+    in_params="T a, T b",
+    out_params="T c",
+    operation="c = a + b;",
+    name="array_add",
+)
 
+# Compute sqrt(sum(x[i] * x[i])) using FP64 accumulation.
+frobenius_norm = cp.ReductionKernel(
+    in_params="T x",
+    out_params="float64 norm",
+    # Explicitly cast mapped values and accumulate in FP64.
+    map_expr="(double)x * (double)x", 
+    reduce_expr="a + b",
+    post_map_expr="norm = sqrt(a)",
+    identity="0.0",
+    reduce_type="double",
+    name="frobenius_norm",
+)
 
-n = 1_000
+rows = 4096
+cols = 4096
+d_a = cp.random.random((rows, cols), dtype=cp.float64)
+d_b = cp.random.random((rows, cols), dtype=cp.float64)
+d_c = cp.empty_like(d_a)
 
-u = np.random.random(n * n).astype(np.float64)
-unew = np.zeros_like(u)
+# Warm up both kernels to trigger compilation and caching.
+array_add(d_a, d_b, d_c)
+frobenius_norm(d_c)
+cp.cuda.get_current_stream().synchronize()
 
-# The loop bounds contain only physical-interior points.
-for i in range(1, n - 1):
-    for j in range(1, n - 1):
-        jacobi_point_update(u, unew, i, j, n)
+# Profile the cached kernels.
+cp.cuda.nvtx.RangePush("Elementwise addition and Frobenius norm")
+array_add(d_a, d_b, d_c)
+norm = frobenius_norm(d_c)
+cp.cuda.get_current_stream().synchronize()
+cp.cuda.nvtx.RangePop()
 
-print("Execution complete.")
+# Verify the results outside the profiled region.
+d_r = d_a + d_b
+norm_r = cp.linalg.norm(d_r)
+# Improved Assertions
+cp.testing.assert_allclose(d_c, d_r, rtol=1.0e-12, atol=1.0e-12)
+cp.testing.assert_allclose(norm, norm_r, rtol=1.0e-12, atol=1.0e-12)
+print("Verification passed.")

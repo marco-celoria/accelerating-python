@@ -1,48 +1,41 @@
 import cupy as cp
 
-# Compute c = a + b element by element.
-array_add = cp.ElementwiseKernel(
-    in_params="T a, T b",
-    out_params="T c",
-    operation="c = a + b;",
-    name="array_add",
-)
+@cp.fuse(kernel_name="fused_jacobi_expression")
+def fused_jacobi_expression(left, right, down, up):
+    return 0.25 * (left + right + down + up)
 
-# Compute sqrt(sum(x[i] * x[i])) using FP64 accumulation.
-frobenius_norm = cp.ReductionKernel(
-    in_params="T x",
-    out_params="float64 norm",
-    # Explicitly cast mapped values and accumulate in FP64.
-    map_expr="(double)x * (double)x", 
-    reduce_expr="a + b",
-    post_map_expr="norm = sqrt(a)",
-    identity="0.0",
-    reduce_type="double",
-    name="frobenius_norm",
-)
+def jacobi_step_fused(d_u, d_v):
+    left = d_u[1:-1, :-2]
+    right = d_u[1:-1, 2:]
+    down = d_u[:-2, 1:-1]
+    up = d_u[2:, 1:-1]
+    d_v[1:-1, 1:-1] = fused_jacobi_expression(left, right, down, up)
 
-rows = 4096
-cols = 4096
-d_a = cp.random.random((rows, cols), dtype=cp.float64)
-d_b = cp.random.random((rows, cols), dtype=cp.float64)
-d_c = cp.empty_like(d_a)
 
-# Warm up both kernels to trigger compilation and caching.
-array_add(d_a, d_b, d_c)
-frobenius_norm(d_c)
-cp.cuda.get_current_stream().synchronize()
+n = 10_000
+d_u = cp.random.random((n, n), dtype=cp.float64)
+d_v = cp.zeros_like(d_u)
 
-# Profile the cached kernels.
-cp.cuda.nvtx.RangePush("Elementwise addition and Frobenius norm")
-array_add(d_a, d_b, d_c)
-norm = frobenius_norm(d_c)
-cp.cuda.get_current_stream().synchronize()
+stream = cp.cuda.get_current_stream()
+start = cp.cuda.Event()
+stop = cp.cuda.Event()
+
+# Warm up and compile the fused kernel.
+jacobi_step_fused(d_u, d_v)
+stream.synchronize()
+
+cp.cuda.nvtx.RangePush("Fused Jacobi expression", id_color=2,)
+
+start.record(stream)
+jacobi_step_fused(d_u, d_v)
+stop.record(stream)
+
+stop.synchronize()
 cp.cuda.nvtx.RangePop()
 
-# Verify the results outside the profiled region.
-d_r = d_a + d_b
-norm_r = cp.linalg.norm(d_r)
-# Improved Assertions
-cp.testing.assert_allclose(d_c, d_r, rtol=1.0e-12, atol=1.0e-12)
-cp.testing.assert_allclose(norm, norm_r, rtol=1.0e-12, atol=1.0e-12)
+elapsed_ms = cp.cuda.get_elapsed_time(start, stop)
+print(f"Elapsed time: {elapsed_ms:.6f} ms")
+d_r = cp.zeros_like(d_u)
+d_r[1:-1, 1:-1] = 0.25 * (d_u[1:-1, :-2] + d_u[1:-1, 2:] + d_u[:-2, 1:-1] + d_u[2:, 1:-1])
+cp.testing.assert_allclose(d_v, d_r, rtol=1.0e-12, atol=1.0e-12,)
 print("Verification passed.")

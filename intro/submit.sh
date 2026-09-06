@@ -42,7 +42,7 @@ python intro_cupy_numba_01.py
 python intro_cupy_numba_02.py
 python intro_cupy_numba_03.py
 ${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_prof_intro_04_pinned.job${SLURM_JOB_ID} python intro_cupy_numba_04.py
-python intro_cupy_numba_05.py
+${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_prof_intro_05_streams.job${SLURM_JOB_ID} python intro_cupy_numba_05.py
 ${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_prof_intro_06_nonfused.job${SLURM_JOB_ID} python intro_cupy_numba_06.py
 ${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_prof_intro_07_fused.job${SLURM_JOB_ID} python intro_cupy_numba_07.py
 python intro_cupy_numba_08.py
