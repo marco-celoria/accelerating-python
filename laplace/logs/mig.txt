@@ -1,5 +1,0 @@
-name, mig.mode.current
-NVIDIA A100-SXM-64GB, Disabled
-NVIDIA A100-SXM-64GB, Disabled
-NVIDIA A100-SXM-64GB, Disabled
-NVIDIA A100-SXM-64GB, Disabled

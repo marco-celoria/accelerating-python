@@ -1,5 +1,0 @@
-# Library version: 1.20.0
-# Library path: /leonardo/prod/spack/06/install/0.22/linux-rhel8-icelake/gcc-8.5.0/nvhpc-25.11-ayzlbce6ohpmv72ncfv4ogitmppp2usq/Linux_x86_64/25.11/comm_libs/13.0/hpcx/hpcx-2.25.1/ucx/lib/libucs.so.0
-# API headers version: 1.20.0
-# Git branch '', revision be940c1
-# Configured with: --disable-logging --disable-debug --disable-assertions --disable-params-check --with-knem --with-xpmem=/hpc/local/oss/xpmem/v2.7.1 --without-java --enable-devel-headers --with-fuse3-static --with-cuda=/hpc/local/oss/cuda13.0.2 --with-gdrcopy --prefix=/build-result/hpcx-v2.25.1-gcc-doca_ofed-redhat8-cuda13-x86_64/ucx --with-bfd=/hpc/local/oss/binutils/2.37/redhat8
