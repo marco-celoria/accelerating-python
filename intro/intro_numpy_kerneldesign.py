@@ -15,7 +15,8 @@ def jacobi_point_update(u, unew, i, j, n):
 
 n = 1_000
 
-u = np.random.random(n * n).astype(np.float64)
+u = np.random.random((n,n)).astype(np.float64)
+u = u.ravel()
 unew = np.zeros_like(u)
 
 # The loop bounds contain only physical-interior points.
