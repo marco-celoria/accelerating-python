@@ -135,15 +135,15 @@ number_of_sms = device_attributes["MultiProcessorCount"]
 number_of_blocks = number_of_sms * max_blocks_per_sm
 
 # Warm-up launch
-warmup_n = THREADS_PER_BLOCK
+cp.cuda.nvtx.RangePush("CuPy Warm-up",id_color=1)
+warmup_n = 100 * THREADS_PER_BLOCK
 warmup_x = cp.ones(warmup_n, dtype=cp.float64)
 warmup_y = cp.empty_like(warmup_x)
-
+wormup_reference =  cp.empty_like(warmup_x)
 # The atomic accumulator must be zero before every launch.
 warmup_sum = cp.zeros(1, dtype=cp.float64)
-
 cooperative_normalize(
-    (1,),
+    (100,),
     (THREADS_PER_BLOCK,),
     (
         warmup_x,
@@ -152,14 +152,16 @@ cooperative_normalize(
         np.uint64(warmup_n),
     ),
 )
-
+cp_sum = cp.sum(warmup_x, dtype=cp.float64)
+cp.divide(warmup_x, cp_sum, out=wormup_reference)
+cp.cuda.nvtx.RangePop()
 cp.cuda.get_current_stream().synchronize()
 
 # Profile launch
-n = 1_000_000_001
+n = 2_000_000_001
 x = cp.random.random(n, dtype=cp.float64)
 y = cp.empty_like(x)
-
+reference_y = cp.empty_like(x)
 if not x.flags.c_contiguous or not y.flags.c_contiguous:
     raise ValueError("x and y must be C-contiguous")
 
@@ -170,11 +172,7 @@ if x.data.ptr % 16 != 0 or y.data.ptr % 16 != 0:
 
 # The atomic accumulator must be zero before every launch.
 global_sum = cp.zeros(1, dtype=cp.float64)
-
-cp.cuda.nvtx.RangePush(
-    "CuPy Cooperative Normalize",
-    id_color=1,
-)
+cp.cuda.nvtx.RangePush("CuPy Cooperative Normalize",id_color=1)
 
 cooperative_normalize(
     (number_of_blocks,),
@@ -190,17 +188,16 @@ cooperative_normalize(
 cp.cuda.get_current_stream().synchronize()
 cp.cuda.nvtx.RangePop()
 
+cp.cuda.nvtx.RangePush("CuPy Normalization Reference", id_color=2)
+reference_sum = cp.sum(x, dtype=cp.float64)
+cp.divide(x, reference_sum, out=reference_y)
+cp.cuda.get_current_stream().synchronize()
+cp.cuda.nvtx.RangePop()
+
 # Verification
 computed_sum = global_sum[0].item()
 
-cp.cuda.nvtx.RangePush(
-    "CuPy Normalization Reference",
-    id_color=2,
-)
-reference_sum = cp.sum(x, dtype=cp.float64).item()
-reference_y = x / reference_sum
-cp.cuda.nvtx.RangePop()
-
+reference_sum = reference_sum.item()
 normalized_sum = cp.sum(y, dtype=cp.float64).item()
 
 absolute_error = abs(computed_sum - reference_sum)

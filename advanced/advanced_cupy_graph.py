@@ -7,6 +7,7 @@ stream = cp.cuda.Stream(non_blocking=True)
 # Allocate persistent device buffers before capture.
 # Initialization operations are submitted to this stream.
 shape = (1000, 1000)
+
 with stream:
     x = cp.ones(shape, dtype=cp.float32)
     y = cp.ones(shape, dtype=cp.float32)
@@ -36,6 +37,7 @@ stream.synchronize()
 N = 100
 start_graph = cp.cuda.Event()
 stop_graph = cp.cuda.Event()
+cp.cuda.nvtx.RangePush("Graph", id_color=1)
 with stream:
     start_graph.record(stream)
     for _ in range(N):
@@ -43,7 +45,7 @@ with stream:
     stop_graph.record(stream)
 
 stop_graph.synchronize()
-
+cp.cuda.nvtx.RangePop()
 graph_elapsed_ms = cp.cuda.get_elapsed_time(start_graph, stop_graph)
 graph_average_ms = graph_elapsed_ms / N
 
@@ -55,6 +57,7 @@ cp.testing.assert_allclose(out, expected, rtol=1.e-6, atol=1.e-7)
 # Ordinary eager-launch timing
 start_eager = cp.cuda.Event()
 stop_eager = cp.cuda.Event()
+cp.cuda.nvtx.RangePush("No Graph", id_color=2)
 with stream:
     start_eager.record(stream)
     for _ in range(N):
@@ -64,7 +67,7 @@ with stream:
     stop_eager.record(stream)
 
 stop_eager.synchronize()
-
+cp.cuda.nvtx.RangePop()
 eager_elapsed_ms = cp.cuda.get_elapsed_time(start_eager, stop_eager)
 eager_average_ms = eager_elapsed_ms / N
 

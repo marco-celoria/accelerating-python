@@ -89,14 +89,19 @@ if number_of_sms <= 0:
     raise RuntimeError(f"Invalid SM count reported by CUDA: {number_of_sms}")
 
 # Warm-up and JIT compilation.
-warmup_n = THREADS_PER_BLOCK
+warmup_n = 100 * THREADS_PER_BLOCK
 warmup_x = cp.ones(warmup_n, dtype=cp.float64)
 warmup_y = cp.empty_like(warmup_x)
+wormup_reference = cp.empty_like(warmup_x)
+
 # The atomic accumulator must be zero before every launch.
 warmup_sum = cp.zeros(1, dtype=cp.float64)
 # Ensure CuPy initialization is complete before the Numba launch.
 cp.cuda.get_current_stream().synchronize()
-cooperative_normalize[1, THREADS_PER_BLOCK](warmup_x, warmup_y, warmup_sum)
+cooperative_normalize[100, THREADS_PER_BLOCK](warmup_x, warmup_y, warmup_sum)
+
+cp_sum = cp.sum(warmup_x, dtype=cp.float64)
+cp.divide(warmup_x, cp_sum, out=wormup_reference)
 cuda.synchronize()
 
 # WORKAROUND:
@@ -144,11 +149,11 @@ print("Verified cooperative blocks per SM:  ", VERIFIED_COOPERATIVE_BLOCKS_PER_S
 print("Selected blocks per SM:              ", selected_blocks_per_sm)
 print("Blocks selected for launch:          ", number_of_blocks)
 
-n = 1_000_000_001
+n = 2_000_000_001
 x = cp.random.random(n, dtype=cp.float64)
 y = cp.empty_like(x)
+reference_y = cp.empty_like(x)
 global_sum = cp.zeros(1, dtype=cp.float64)
-
 cp.cuda.get_current_stream().synchronize()
 cp.cuda.nvtx.RangePush("Numba cooperative normalize", id_color=1,)
 
@@ -158,17 +163,16 @@ try:
 finally:
     cp.cuda.nvtx.RangePop()
 
+cp.cuda.nvtx.RangePush("CuPy Normalization Reference", id_color=2)
+reference_sum = cp.sum(x, dtype=cp.float64)
+cp.divide(x, reference_sum, out=reference_y)
+cuda.synchronize()
+cp.cuda.nvtx.RangePop()
+
 # Verification
 computed_sum = global_sum[0].item()
 
-cp.cuda.nvtx.RangePush(
-    "CuPy Normalization Reference",
-    id_color=2,
-)
-reference_sum = cp.sum(x, dtype=cp.float64).item()
-reference_y = x / reference_sum
-cp.cuda.nvtx.RangePop()
-
+reference_sum = reference_sum.item()
 normalized_sum = cp.sum(y, dtype=cp.float64).item()
 
 absolute_error = abs(computed_sum - reference_sum)
