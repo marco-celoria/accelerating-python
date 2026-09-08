@@ -35,7 +35,7 @@ void jacobi_2d(
 }
 ''', "jacobi_2d", )
 
-n = 1_000
+n = 10_000
 u = cp.random.random((n, n), dtype=cp.float64)
 left  = u[1:-1, :-2]
 right = u[1:-1, 2:]
