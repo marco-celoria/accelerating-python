@@ -523,14 +523,14 @@ def main() -> int:
     parser.add_argument(
         "--tpb-x",
         type=int,
-        default=16,
+        default=32,
         help="CUDA threads per block in x direction",
     )
 
     parser.add_argument(
         "--tpb-y",
         type=int,
-        default=16,
+        default=8,
         help="CUDA threads per block in y direction",
     )
 

@@ -12,7 +12,8 @@ import numpy as np
 # DEFAULTS
 # ============================================================
 
-DEFAULT_TPB = 16
+DEFAULT_TPB_X = 32
+DEFAULT_TPB_Y = 8
 
 
 # ============================================================
@@ -91,32 +92,49 @@ def validate_positive_int(name: str, value: int) -> None:
         raise ValueError(f"{name} must be > 0")
 
 
-def validate_tpb(tpb: int) -> None:
-    validate_positive_int("tpb", tpb)
+def validate_block_size(tpb_x: int, tpb_y: int) -> None:
+    """
+    Validate a rectangular two-dimensional CUDA thread block.
+
+    The block is interpreted as:
+
+        block = (tpb_x, tpb_y)
+
+    where:
+        x maps to output columns
+        y maps to output rows
+    """
+    validate_positive_int("tpb_x", tpb_x)
+    validate_positive_int("tpb_y", tpb_y)
 
     device = cp.cuda.Device()
-    
-    threads_per_block = tpb * tpb
-    max_threads_per_block = device.attributes["MaxThreadsPerBlock"]
-    max_block_dim_x = device.attributes["MaxBlockDimX"]
-    max_block_dim_y = device.attributes["MaxBlockDimY"]
+    attributes = device.attributes
+
+    threads_per_block = tpb_x * tpb_y
+
+    max_threads_per_block = attributes["MaxThreadsPerBlock"]
+    max_block_dim_x = attributes["MaxBlockDimX"]
+    max_block_dim_y = attributes["MaxBlockDimY"]
 
     if threads_per_block > max_threads_per_block:
         raise ValueError(
-            f"tpb={tpb} gives {threads_per_block} threads/block, "
-            f"but the device supports at most {max_threads_per_block}."
+            f"CUDA block ({tpb_x}, {tpb_y}) has "
+            f"{threads_per_block} threads, but device "
+            f"{device.id} supports at most "
+            f"{max_threads_per_block} threads per block"
         )
 
-    if tpb > max_block_dim_x:
+    if tpb_x > max_block_dim_x:
         raise ValueError(
-            f"tpb={tpb} exceeds MaxBlockDimX={max_block_dim_x}."
+            f"tpb_x={tpb_x} exceeds "
+            f"MaxBlockDimX={max_block_dim_x}"
         )
 
-    if tpb > max_block_dim_y:
+    if tpb_y > max_block_dim_y:
         raise ValueError(
-            f"tpb={tpb} exceeds MaxBlockDimY={max_block_dim_y}."
+            f"tpb_y={tpb_y} exceeds "
+            f"MaxBlockDimY={max_block_dim_y}"
         )
-
 
 def validate_matrix_shapes(a: cp.ndarray, b: cp.ndarray, c: cp.ndarray) -> None:
     if a.ndim != 2 or b.ndim != 2 or c.ndim != 2:
@@ -148,15 +166,34 @@ def validate_matrix_shapes(a: cp.ndarray, b: cp.ndarray, c: cp.ndarray) -> None:
         raise ValueError("C must be C-contiguous")
 
 
-def compute_launch_geometry(a: cp.ndarray, b: cp.ndarray, tpb: int):
+def compute_launch_geometry(
+    a: cp.ndarray,
+    b: cp.ndarray,
+    tpb_x: int,
+    tpb_y: int,
+):
+    """
+    Compute a two-dimensional rectangular CUDA launch geometry.
+
+    Thread mapping:
+
+        threadIdx.x -> output column
+        threadIdx.y -> output row
+
+    Therefore:
+
+        block = (tpb_x, tpb_y)
+        grid  = (ceil(columns / tpb_x),
+                 ceil(rows / tpb_y))
+    """
     rows_c = a.shape[0]
     cols_c = b.shape[1]
-    
-    blocks_x = (cols_c + tpb - 1) // tpb
-    blocks_y = (rows_c + tpb - 1) // tpb
+
+    blocks_x = (cols_c + tpb_x - 1) // tpb_x
+    blocks_y = (rows_c + tpb_y - 1) // tpb_y
 
     grid = (blocks_x, blocks_y)
-    block = (tpb, tpb)
+    block = (tpb_x, tpb_y)
 
     return grid, block
 
@@ -278,14 +315,15 @@ def matmul(
     c_d: cp.ndarray,
     iters: int,
     kernel,
-    tpb: int,
+    tpb_x: int,
+    tpb_y: int,
     dtype: np.dtype,
 ) -> bool:
     validate_positive_int("iters", iters)
-    validate_tpb(tpb)
+    validate_block_size(tpb_x, tpb_y)
     validate_matrix_shapes(a_d, b_d, c_d)
     validate_selected_dtype(a_d, b_d, c_d, dtype)
-    grid, block = compute_launch_geometry(a_d, b_d, tpb)
+    grid, block = compute_launch_geometry(a_d, b_d ,tpb_x, tpb_y)
 
     print(f"blockspergrid   = {grid}")
     print(f"threadsperblock = {block}")
@@ -539,12 +577,22 @@ def main() -> int:
         help=("Floating-point precision. FP64 throughput is strongly GPU-dependent and may be much lower on non-HPC GPUs."),
     )
 
+
     parser.add_argument(
-        "--tpb",
+        "--tpb-x",
         type=int,
-        default=DEFAULT_TPB,
-        help="Threads per block dimension. Block shape is tpb x tpb.",
+        default=DEFAULT_TPB_X,
+        help=("CUDA threads per block in the x direction. The x dimension maps to output columns."),
     )
+
+    parser.add_argument(
+        "--tpb-y",
+        type=int,
+        default=DEFAULT_TPB_Y,
+        help=(
+        "CUDA threads per block in the y direction. The y dimension maps to output rows."),
+    )
+
 
     parser.add_argument(
         "--seed",
@@ -559,12 +607,9 @@ def main() -> int:
     validate_positive_int("m", args.m)
     validate_positive_int("l", args.l)
     validate_positive_int("iters", args.iters)
-    validate_positive_int("tpb", args.tpb)
-
     if cp.cuda.runtime.getDeviceCount() <= 0:
         raise RuntimeError("No CUDA device found")
-    
-    validate_tpb(args.tpb)
+    validate_block_size(args.tpb_x, args.tpb_y)
 
     if args.dtype == "float32":
         dtype_cp = cp.float32
@@ -584,7 +629,9 @@ def main() -> int:
     print(f"C shape: {n} x {m}")
     print(f"dtype:   {dtype_np}")
     print(f"iters:   {args.iters}")
-    print(f"tpb:     {args.tpb}")
+    print(f"tpb_x:   {args.tpb_x}")
+    print(f"tpb_y:   {args.tpb_y}")
+    print(f"block:   ({args.tpb_x}, {args.tpb_y})")
     
     rng = np.random.default_rng(args.seed)
 
@@ -613,7 +660,8 @@ def main() -> int:
         c_d=z_d,
         iters=args.iters,
         kernel=kernel,
-        tpb=args.tpb,
+        tpb_x=args.tpb_x,
+        tpb_y=args.tpb_y,
         dtype=dtype_np,
     )
 
