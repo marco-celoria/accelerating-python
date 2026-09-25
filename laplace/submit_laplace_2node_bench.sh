@@ -14,7 +14,8 @@
 
 set -euo pipefail
 mkdir -p logs outputs_${SLURM_JOB_ID}
-
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
+echo "OMP_NUM_THREADS=$OMP_NUM_THREADS"
 # ---------------------------------------------------------------------------
 # Leonardo modules
 # ---------------------------------------------------------------------------
@@ -94,47 +95,68 @@ srun -N1 -n1 python laplace_numba.py \
   --tol -1.0 \
   --output outputs_${SLURM_JOB_ID}/out_laplace_numba_100.h5
 
-srun -N1 -n4 python laplace_cupy_nccl.py \
+srun -N1 -n1 python laplace_cupy_nccl.py \
   --nx 40000 \
   --ny 40000 \
   --fixed-iters 100 \
   --tol -1.0 \
   --output outputs_${SLURM_JOB_ID}/out_laplace_cupy_nccl_100_1.h5
 
-srun -N1 -n4 python laplace_cupy_mpi.py \
+srun -N1 -n1 python laplace_cupy_mpi.py \
   --nx 40000 \
   --ny 40000 \
   --fixed-iters 100 \
   --tol -1.0 \
   --output outputs_${SLURM_JOB_ID}/out_laplace_cupy_mpi_100_1.h5
 
-srun -N1 -n4 python laplace_numba_mpi.py \
+srun -N1 -n1 python laplace_numba_mpi.py \
   --nx 40000 \
   --ny 40000 \
   --fixed-iters 100 \
   --tol -1.0 \
   --output outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100_1.h5
 
+srun -N1 -n4 python laplace_cupy_nccl.py \
+  --nx 40000 \
+  --ny 40000 \
+  --fixed-iters 100 \
+  --tol -1.0 \
+  --output outputs_${SLURM_JOB_ID}/out_laplace_cupy_nccl_100_4.h5
+
+srun -N1 -n4 python laplace_cupy_mpi.py \
+  --nx 40000 \
+  --ny 40000 \
+  --fixed-iters 100 \
+  --tol -1.0 \
+  --output outputs_${SLURM_JOB_ID}/out_laplace_cupy_mpi_100_4.h5
+
+srun -N1 -n4 python laplace_numba_mpi.py \
+  --nx 40000 \
+  --ny 40000 \
+  --fixed-iters 100 \
+  --tol -1.0 \
+  --output outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100_4.h5
+
 srun -N2 -n8 python laplace_cupy_nccl.py \
   --nx 40000 \
   --ny 40000 \
   --fixed-iters 100 \
   --tol -1.0 \
-  --output outputs_${SLURM_JOB_ID}/out_laplace_cupy_nccl_100_2.h5
+  --output outputs_${SLURM_JOB_ID}/out_laplace_cupy_nccl_100_8.h5
 
 srun -N2 -n8 python laplace_cupy_mpi.py \
   --nx 40000 \
   --ny 40000 \
   --fixed-iters 100 \
   --tol -1.0 \
-  --output outputs_${SLURM_JOB_ID}/out_laplace_cupy_mpi_100_2.h5
+  --output outputs_${SLURM_JOB_ID}/out_laplace_cupy_mpi_100_8.h5
 
 srun -N2 -n8 python laplace_numba_mpi.py \
   --nx 40000 \
   --ny 40000 \
   --fixed-iters 100 \
   --tol -1.0 \
-  --output outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100_2.h5
+  --output outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100_8.h5
 
 echo "Comparing CuPy vs Numba"
 python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_cupy_100.h5 outputs_${SLURM_JOB_ID}/out_laplace_numba_100.h5
@@ -151,12 +173,20 @@ python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_cupy_100.h5 outputs_${S
 echo "Comparing Numba vs Numba + MPI"
 python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_numba_100.h5 outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100_2.h5
 
-echo "Comparing 1-node vs 2-node: CuPy + NCCL"
-python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_cupy_nccl_100_1.h5 outputs_${SLURM_JOB_ID}/out_laplace_cupy_nccl_100_2.h5
+echo "Comparing 1-GPU vs 4-GPUs: CuPy + NCCL"
+python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_cupy_nccl_100_1.h5 outputs_${SLURM_JOB_ID}/out_laplace_cupy_nccl_100_4.h5
 
-echo "Comparing 1-node vs 2-node: CuPy + MPI"
-python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_cupy_mpi_100_1.h5 outputs_${SLURM_JOB_ID}/out_laplace_cupy_mpi_100_2.h5
+echo "Comparing 1-GPU vs 4-GPUs: CuPy + MPI"
+python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_cupy_mpi_100_1.h5 outputs_${SLURM_JOB_ID}/out_laplace_cupy_mpi_100_4.h5
 
-echo "Comparing 1-node vs 2-node: Numba + MPI"
-python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100_1.h5 outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100_2.h5
+echo "Comparing 1-GPU vs 4-GPUs: Numba + MPI"
+python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100_1.h5 outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100_4.h5
 
+echo "Comparing 1-GPU vs 8-GPUs: CuPy + NCCL"
+python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_cupy_nccl_100_1.h5 outputs_${SLURM_JOB_ID}/out_laplace_cupy_nccl_100_8.h5
+
+echo "Comparing 1-GPU vs 8-GPUs: CuPy + MPI"
+python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_cupy_mpi_100_1.h5 outputs_${SLURM_JOB_ID}/out_laplace_cupy_mpi_100_8.h5
+
+echo "Comparing 1-GPU vs 8-GPUs: Numba + MPI"
+python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100_1.h5 outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100_8.h5
