@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=8
 #SBATCH --partition=boost_usr_prod
 #SBATCH --time=0:30:00
 #SBATCH --mem=0
@@ -14,6 +14,8 @@
 
 set -euo pipefail
 mkdir -p logs 
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
+echo "OMP_NUM_THREADS=$OMP_NUM_THREADS"
 
 # ---------------------------------------------------------------------------
 # Leonardo modules

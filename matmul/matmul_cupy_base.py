@@ -13,7 +13,7 @@ import numpy as np
 # ============================================================
 
 DEFAULT_TPB_X = 32
-DEFAULT_TPB_Y = 8
+DEFAULT_TPB_Y = 32
 
 
 # ============================================================
@@ -43,7 +43,6 @@ __global__ void mm_kernel_base(
     }
 
     T acc = static_cast<T>(0);
-
     for (size_t k = 0; k < A_num_cols; ++k) {
         acc += A[row * A_num_cols + k] * B[k * B_num_cols + col];
     }
@@ -136,7 +135,7 @@ def validate_block_size(tpb_x: int, tpb_y: int) -> None:
             f"MaxBlockDimY={max_block_dim_y}"
         )
 
-def validate_matrix_shapes(a: cp.ndarray, b: cp.ndarray, c: cp.ndarray) -> None:
+def validate_matrix_shapes(a, b, c) -> None:
     if a.ndim != 2 or b.ndim != 2 or c.ndim != 2:
         raise ValueError("A, B, and C must all be 2D matrices")
 
@@ -252,6 +251,9 @@ def gpu_kernel_time_seconds(
     kernel,
     grid,
     block,
+    a_num_rows,
+    b_num_cols,
+    a_num_cols,
     a_d: cp.ndarray,
     b_d: cp.ndarray,
     c_d: cp.ndarray,
@@ -271,9 +273,9 @@ def gpu_kernel_time_seconds(
             grid,
             block,
             (
-                np.uint64(a_d.shape[0]),
-                np.uint64(b_d.shape[1]),
-                np.uint64(a_d.shape[1]),
+                a_num_rows,
+                b_num_cols,
+                a_num_cols,
                 a_d,
                 b_d,
                 c_d,
@@ -305,21 +307,65 @@ def validate_selected_dtype(
             f"A={a.dtype}, B={b.dtype}, C={c.dtype}"
         )
 
+
+def validate_input_matrices(a, b, dtype: np.dtype) -> None:
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("A and B must both be 2D matrices")
+
+    if a.shape[1] != b.shape[0]:
+        raise ValueError(
+            f"Incompatible matrix shapes: A{a.shape} and B{b.shape}; "
+            "A.shape[1] must equal B.shape[0]"
+        )
+
+    expected_dtype = np.dtype(dtype)
+
+    if np.dtype(a.dtype) != expected_dtype:
+        raise TypeError(
+            f"A must have dtype {expected_dtype}, got {a.dtype}"
+        )
+
+    if np.dtype(b.dtype) != expected_dtype:
+        raise TypeError(
+            f"B must have dtype {expected_dtype}, got {b.dtype}"
+        )
+
+    if not a.flags.c_contiguous:
+        raise ValueError("A must be C-contiguous")
+
+    if not b.flags.c_contiguous:
+        raise ValueError("B must be C-contiguous")
+
+
 # ============================================================
 # BENCHMARK DRIVER
 # ============================================================
 
 def matmul(
-    a_d: cp.ndarray,
-    b_d: cp.ndarray,
-    c_d: cp.ndarray,
+    a_h: np.ndarray,
+    b_h: np.ndarray,
     iters: int,
     kernel,
     tpb_x: int,
     tpb_y: int,
     dtype: np.dtype,
 ) -> bool:
+    
     validate_positive_int("iters", iters)
+    validate_input_matrices(a_h, b_h, dtype)
+    # Preallocate CPU output to avoid allocation in the timed CPU loop.
+    check_h = np.empty((a_h.shape[0], b_h.shape[1]), dtype=dtype)
+    validate_matrix_shapes(a_h, b_h, check_h)
+    with nvtx_range("H2D input copies"):
+        a_d = cp.asarray(a_h)
+        b_d = cp.asarray(b_h)
+    with nvtx_range("Device output allocation"):
+        c_d = cp.empty((a_d.shape[0], b_d.shape[1]), dtype=a_d.dtype,)
+
+    a_num_rows = np.uint64(a_d.shape[0])
+    b_num_cols = np.uint64(b_d.shape[1])
+    a_num_cols = np.uint64(a_d.shape[1])
+
     validate_block_size(tpb_x, tpb_y)
     validate_matrix_shapes(a_d, b_d, c_d)
     validate_selected_dtype(a_d, b_d, c_d, dtype)
@@ -327,14 +373,6 @@ def matmul(
 
     print(f"blockspergrid   = {grid}")
     print(f"threadsperblock = {block}")
-
-    # Copy inputs once for CPU reference.
-    with nvtx_range("D2H input copies"):
-        a_h = cp.asnumpy(a_d)
-        b_h = cp.asnumpy(b_d)
-
-    # Preallocate CPU output to avoid allocation in the timed CPU loop.
-    check_h = np.empty((a_h.shape[0], b_h.shape[1]), dtype=dtype)
 
     # --------------------------------------------------------
     # Warm-up launch
@@ -349,9 +387,9 @@ def matmul(
             grid,
             block,
             (
-                np.uint64(a_d.shape[0]),
-                np.uint64(b_d.shape[1]),
-                np.uint64(a_d.shape[1]),
+                a_num_rows,
+                b_num_cols,
+                a_num_cols,
                 a_d,
                 b_d,
                 c_d,
@@ -386,6 +424,9 @@ def matmul(
             kernel=kernel,
             grid=grid,
             block=block,
+            a_num_rows=a_num_rows,
+            b_num_cols=b_num_cols,
+            a_num_cols=a_num_cols,
             a_d=a_d,
             b_d=b_d,
             c_d=c_d,
@@ -612,10 +653,8 @@ def main() -> int:
     validate_block_size(args.tpb_x, args.tpb_y)
 
     if args.dtype == "float32":
-        dtype_cp = cp.float32
         dtype_np = np.dtype(np.float32)
     elif args.dtype == "float64":
-        dtype_cp = cp.float64
         dtype_np = np.dtype(np.float64)
     else:
         raise TypeError("dtype must be either float32 or float64")
@@ -638,11 +677,6 @@ def main() -> int:
     x_h = rng.standard_normal((n, l)).astype(dtype_np)
     y_h = rng.standard_normal((l, m)).astype(dtype_np)
 
-    with nvtx_range("GPU allocation and initialization"):
-        x_d = cp.asarray(x_h)
-        y_d = cp.asarray(y_h)
-        z_d = cp.zeros((n, m), dtype=dtype_cp)
-
     print("Compiling RawModule kernels...")
     ker_float, ker_double = compile_kernels()
     print("Compilation complete.")
@@ -655,9 +689,8 @@ def main() -> int:
         raise TypeError("dtype must be either float32 or float64")
 
     check_passed = matmul(
-        a_d=x_d,
-        b_d=y_d,
-        c_d=z_d,
+        a_h=x_h,
+        b_h=y_h,
         iters=args.iters,
         kernel=kernel,
         tpb_x=args.tpb_x,

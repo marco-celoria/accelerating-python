@@ -45,7 +45,7 @@ def validate_positive_int(name: str, value: int) -> None:
         raise ValueError(f"{name} must be > 0")
 
 
-def validate_matrix_shapes(a: cp.ndarray, b: cp.ndarray, c: cp.ndarray) -> None:
+def validate_matrix_shapes(a, b, c) -> None:
     if a.ndim != 2 or b.ndim != 2 or c.ndim != 2:
         raise ValueError("A, B, and C must all be 2D matrices")
 
@@ -149,29 +149,58 @@ def gpu_matmul_time_seconds(
 
     return cp.cuda.get_elapsed_time(start_event, stop_event) * 1.0e-3
 
+def validate_input_matrices(a, b, dtype: np.dtype) -> None:
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("A and B must both be 2D matrices")
+
+    if a.shape[1] != b.shape[0]:
+        raise ValueError(
+            f"Incompatible matrix shapes: A{a.shape} and B{b.shape}; "
+            "A.shape[1] must equal B.shape[0]"
+        )
+
+    expected_dtype = np.dtype(dtype)
+
+    if np.dtype(a.dtype) != expected_dtype:
+        raise TypeError(
+            f"A must have dtype {expected_dtype}, got {a.dtype}"
+        )
+
+    if np.dtype(b.dtype) != expected_dtype:
+        raise TypeError(
+            f"B must have dtype {expected_dtype}, got {b.dtype}"
+        )
+
+    if not a.flags.c_contiguous:
+        raise ValueError("A must be C-contiguous")
+
+    if not b.flags.c_contiguous:
+        raise ValueError("B must be C-contiguous")
 
 # ============================================================
 # BENCHMARK DRIVER
 # ============================================================
 
 def matmul(
-    a_d: cp.ndarray,
-    b_d: cp.ndarray,
-    c_d: cp.ndarray,
+    a_h: np.ndarray,
+    b_h: np.ndarray,
     iters: int,
     dtype: np.dtype,
 ) -> bool:
+
+    # Preallocate CPU output to avoid allocation in the timed CPU loop.
     validate_positive_int("iters", iters)
+    validate_input_matrices(a_h, b_h, dtype)
+    check_h = np.empty((a_h.shape[0], b_h.shape[1]), dtype=dtype)
+    validate_matrix_shapes(a_h, b_h, check_h)
+    with nvtx_range("H2D input copies"):
+        a_d = cp.asarray(a_h)
+        b_d = cp.asarray(b_h)
+    with nvtx_range("Device output allocation"):
+        c_d = cp.empty((a_d.shape[0], b_d.shape[1]), dtype=a_d.dtype,)
+
     validate_matrix_shapes(a_d, b_d, c_d)
     validate_selected_dtype(a_d, b_d, c_d, dtype)
-
-    # Copy inputs once for CPU reference.
-    with nvtx_range("D2H input copies"):
-        a_h = cp.asnumpy(a_d)
-        b_h = cp.asnumpy(b_d)
-
-    # Preallocate CPU output to avoid allocation inside timed loop.
-    check_h = np.empty((a_h.shape[0], b_h.shape[1]), dtype=dtype)
 
     # --------------------------------------------------------
     # Warm-up.
@@ -198,7 +227,6 @@ def matmul(
     timings_cpu = np.empty(iters, dtype=np.float64)
 
     rtol, atol = dtype_tolerances(dtype)
-   
 
     # ------------------------------------------------------------
     # GPU timing
@@ -424,10 +452,8 @@ def main() -> int:
         raise RuntimeError("No CUDA device found")
 
     if args.dtype == "float32":
-        dtype_cp = cp.float32
         dtype_np = np.dtype(np.float32)
     elif args.dtype == "float64":
-        dtype_cp = cp.float64
         dtype_np = np.dtype(np.float64)
     else:
         raise TypeError("dtype must be either float32 or float64")
@@ -447,15 +473,9 @@ def main() -> int:
     x_h = rng.standard_normal((n, l)).astype(dtype_np)
     y_h = rng.standard_normal((l, m)).astype(dtype_np)
 
-    with nvtx_range("GPU allocation and initialization"):
-        x_d = cp.asarray(x_h)
-        y_d = cp.asarray(y_h)
-        z_d = cp.zeros((n, m), dtype=dtype_cp)
-
     check_passed = matmul(
-        a_d=x_d,
-        b_d=y_d,
-        c_d=z_d,
+        a_h=x_h,
+        b_h=y_h,
         iters=args.iters,
         dtype=dtype_np
     )

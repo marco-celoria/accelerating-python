@@ -14,6 +14,8 @@
 
 set -euo pipefail
 mkdir -p logs
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
+echo "OMP_NUM_THREADS=$OMP_NUM_THREADS"
 # ---------------------------------------------------------------------------
 # Leonardo modules
 # ---------------------------------------------------------------------------

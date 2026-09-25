@@ -143,6 +143,7 @@ def validate_block_size(tpb_x: int, tpb_y: int) -> None:
         )
 
 
+
 def validate_matrix_shapes(a, b, c) -> None:
     if len(a.shape) != 2 or len(b.shape) != 2 or len(c.shape) != 2:
         raise ValueError("A, B, and C must all be 2D matrices")
@@ -208,9 +209,12 @@ def gpu_kernel_time_seconds(
     kernel,
     blockspergrid,
     threadsperblock,
-    a_d,
-    b_d,
-    c_d,
+    a_num_rows,
+    b_num_cols,
+    a_num_cols,
+    a_d_flat,
+    b_d_flat,
+    c_d_flat,
     start_event,
     stop_event,
 ) -> float:
@@ -221,9 +225,8 @@ def gpu_kernel_time_seconds(
     It avoids including most CPU-side wall-clock overhead from perf_counter().
     """
     start_event.record()
-
     with nvtx_range("Launch GPU matmul kernel", id_color=1):
-        kernel[blockspergrid, threadsperblock](np.uint64(a_d.shape[0]), np.uint64(b_d.shape[1]), np.uint64(a_d.shape[1]), a_d.ravel(), b_d.ravel(), c_d.ravel())
+        kernel[blockspergrid, threadsperblock](a_num_rows, b_num_cols, a_num_cols, a_d_flat, b_d_flat, c_d_flat)
 
     stop_event.record()
     stop_event.synchronize()
@@ -253,22 +256,68 @@ def validate_matrix_dtypes(a, b, c, dtype: np.dtype) -> None:
             f"C={actual_dtypes[2]}"
         )
 
+def validate_input_matrices(a, b, dtype: np.dtype) -> None:
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("A and B must both be 2D matrices")
+
+    if a.shape[1] != b.shape[0]:
+        raise ValueError(
+            f"Incompatible matrix shapes: A{a.shape} and B{b.shape}; "
+            "A.shape[1] must equal B.shape[0]"
+        )
+
+    expected_dtype = np.dtype(dtype)
+
+    if np.dtype(a.dtype) != expected_dtype:
+        raise TypeError(
+            f"A must have dtype {expected_dtype}, got {a.dtype}"
+        )
+
+    if np.dtype(b.dtype) != expected_dtype:
+        raise TypeError(
+            f"B must have dtype {expected_dtype}, got {b.dtype}"
+        )
+
+    if not a.flags.c_contiguous:
+        raise ValueError("A must be C-contiguous")
+
+    if not b.flags.c_contiguous:
+        raise ValueError("B must be C-contiguous")
+
 
 # ============================================================
 # BENCHMARK DRIVER
 # ============================================================
 
 def matmul(
-    a_d,
-    b_d,
-    c_d,
+    a_h,
+    b_h,
     iters: int,
     kernel,
     tpb_x: int,
     tpb_y: int,
     dtype: np.dtype,
 ) -> bool:
+    
+    # Preallocate CPU reference output.
+    # This avoids allocating a new array inside the CPU timing loop.
     validate_positive_int("iters", iters)
+    validate_input_matrices(a_h, b_h, dtype)
+    check_h = np.empty((a_h.shape[0], b_h.shape[1]), dtype=dtype)
+    validate_matrix_shapes(a_h, b_h, check_h)
+    with nvtx_range("H2D memory copies", id_color=6):
+        a_d = cuda.to_device(a_h)
+        b_d = cuda.to_device(b_h)
+    with nvtx_range("Device output allocation", id_color=6):
+        c_d = cuda.device_array((a_h.shape[0], b_h.shape[1]), dtype=dtype)   
+
+    a_d_flat = a_d.ravel()
+    b_d_flat = b_d.ravel()
+    c_d_flat = c_d.ravel()
+    a_num_rows = np.int64(a_d.shape[0])
+    b_num_cols = np.int64(b_d.shape[1])
+    a_num_cols = np.int64(a_d.shape[1])
+
     validate_matrix_shapes(a_d, b_d, c_d)
     validate_block_size(tpb_x, tpb_y)
     validate_matrix_dtypes(a_d, b_d, c_d, dtype)
@@ -283,15 +332,6 @@ def matmul(
     print(f"blockspergrid   = {blockspergrid}")
     print(f"threadsperblock = {threadsperblock}")
 
-    # Copy inputs once for CPU reference.
-    with nvtx_range("D2H input copies", id_color=2):
-        a_h = a_d.copy_to_host()
-        b_h = b_d.copy_to_host()
-
-    # Preallocate CPU reference output.
-    # This avoids allocating a new array inside the CPU timing loop.
-    check_h = np.empty((a_h.shape[0], b_h.shape[1]), dtype=dtype)
-
     # --------------------------------------------------------
     # Warm-up launch
     #
@@ -300,7 +340,7 @@ def matmul(
     print("Warming up CUDA kernel / compiling Numba specialization...")
 
     with nvtx_range("Warmup kernel", id_color=3):
-        kernel[blockspergrid, threadsperblock](np.uint64(a_d.shape[0]), np.uint64(b_d.shape[1]), np.uint64(a_d.shape[1]), a_d.ravel(), b_d.ravel(), c_d.ravel())
+        kernel[blockspergrid, threadsperblock](a_num_rows, b_num_cols, a_num_cols, a_d_flat, b_d_flat, c_d_flat)
 
     cuda.synchronize()
 
@@ -331,9 +371,12 @@ def matmul(
             kernel=kernel,
             blockspergrid=blockspergrid,
             threadsperblock=threadsperblock,
-            a_d=a_d,
-            b_d=b_d,
-            c_d=c_d,
+            a_num_rows=a_num_rows, 
+            b_num_cols=b_num_cols, 
+            a_num_cols=a_num_cols,
+            a_d_flat=a_d_flat,
+            b_d_flat=b_d_flat,
+            c_d_flat=c_d_flat,
             start_event=start_event,
             stop_event=stop_event,
         )
@@ -530,7 +573,7 @@ def main() -> int:
     parser.add_argument(
         "--tpb-y",
         type=int,
-        default=8,
+        default=32,
         help="CUDA threads per block in y direction",
     )
 
@@ -576,17 +619,10 @@ def main() -> int:
 
     x_h = rng.standard_normal((n, l)).astype(dtype)
     y_h = rng.standard_normal((l, m)).astype(dtype)
-    z_h = np.zeros((n, m), dtype=dtype)
-
-    with nvtx_range("H2D memory copies", id_color=6):
-        x_d = cuda.to_device(x_h)
-        y_d = cuda.to_device(y_h)
-        z_d = cuda.to_device(z_h)
 
     checks_passed = matmul(
-        a_d=x_d,
-        b_d=y_d,
-        c_d=z_d,
+        a_h=x_h,
+        b_h=y_h,
         iters=args.iters,
         kernel=kernel,
         tpb_x=args.tpb_x,

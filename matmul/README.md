@@ -429,8 +429,6 @@ module load cuda
 source /path/to/venv/bin/activate
 
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
-export OPENBLAS_NUM_THREADS="$OMP_NUM_THREADS"
-export MKL_NUM_THREADS="$OMP_NUM_THREADS"
 
 nvidia-smi
 python --version

@@ -47,9 +47,9 @@ def nvtx_range(name: str, id_color: int = -1):
 # The kernel must be launched with exactly (TPB, TPB) threads per block
 # because the shared-memory arrays and matrix indexing use TPB directly.
 # Controls threads per block and shared memory usage.
-# The computation will be done on blocks of TPBxTPB elements.
+# The computation uses square TPB x TPB output tiles.
 # TPB * TPB <= device maximum threads per block
-TPB = 16
+TPB = 32
 
 
 # ============================================================
@@ -88,7 +88,7 @@ def validate_block_size(tpb_x: int, tpb_y: int) -> None:
         )
 
 def validate_shared_memory(tpb: int, dtype: np.dtype) -> int:
-    shared_bytes = 2 * tpb * tpb * np.dtype(dtype).itemsize
+    shared_bytes = 2 * tpb * (tpb) * np.dtype(dtype).itemsize
     device = cuda.get_current_device()
 
     if shared_bytes > device.MAX_SHARED_MEMORY_PER_BLOCK:
@@ -117,6 +117,40 @@ def validate_matrix_shapes(a, b, c) -> None:
         raise ValueError(
             f"Invalid C shape: got C{c.shape}, expected C{expected_c_shape}"
         )
+
+
+def validate_input_matrices(a, b, dtype: np.dtype) -> None:
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("A and B must both be 2D matrices")
+
+    if a.shape[1] != b.shape[0]:
+        raise ValueError(
+            f"Incompatible matrix shapes: A{a.shape} and B{b.shape}; "
+            "A.shape[1] must equal B.shape[0]"
+        )
+
+    expected_dtype = np.dtype(dtype)
+
+    if np.dtype(a.dtype) != expected_dtype:
+        raise TypeError(
+            f"A must have dtype {expected_dtype}, got {a.dtype}"
+        )
+
+    if np.dtype(b.dtype) != expected_dtype:
+        raise TypeError(
+            f"B must have dtype {expected_dtype}, got {b.dtype}"
+        )
+
+    if not a.flags.c_contiguous:
+        raise ValueError("A must be C-contiguous")
+
+    if not b.flags.c_contiguous:
+        raise ValueError("B must be C-contiguous")
+
+
+# ============================================================
+# KERNELS
+# ============================================================
 
 
 @cuda.jit
@@ -170,9 +204,9 @@ def matmul_shared_float64(A_num_rows, B_num_cols, A_num_cols, A, B, C):
        
 @cuda.jit
 def matmul_shared_float32(A_num_rows, B_num_cols, A_num_cols, A, B, C):
-    # Define an array in the shared memory
-    # The size and type of the arrays must be known at compile time
-# Static 2D shared memory buffers (compiled into direct offsets in PTX)
+    # Define an array in shared memory.
+    # The shape and dtype of the arrays must be known at compile time.
+    # Static 2D buffers are compiled into fixed shared-memory storage.
     s_A = cuda.shared.array(shape=(TPB, TPB), dtype=float32)
     s_B = cuda.shared.array(shape=(TPB, TPB), dtype=float32)
 
@@ -267,9 +301,12 @@ def gpu_kernel_time_seconds(
     kernel,
     blockspergrid,
     threadsperblock,
-    a_d,
-    b_d,
-    c_d,
+    a_num_rows,
+    b_num_cols,
+    a_num_cols,
+    a_d_flat,
+    b_d_flat,
+    c_d_flat,
     start_event,
     stop_event,
 ) -> float:
@@ -279,7 +316,7 @@ def gpu_kernel_time_seconds(
     start_event.record()
     
     with nvtx_range("Launch shared-memory matmul", id_color=1):
-        kernel[blockspergrid, threadsperblock](np.uint64(a_d.shape[0]), np.uint64(b_d.shape[1]), np.uint64(a_d.shape[1]), a_d.ravel(), b_d.ravel(), c_d.ravel())
+        kernel[blockspergrid, threadsperblock](a_num_rows, b_num_cols, a_num_cols, a_d_flat, b_d_flat, c_d_flat)
 
     stop_event.record()
     stop_event.synchronize()
@@ -309,18 +346,34 @@ def validate_matrix_dtypes(a, b, c, dtype: np.dtype) -> None:
         )
 
 
+
 def matmul(
-    a_d,
-    b_d,
-    c_d,
+    a_h,
+    b_h,
     iters: int,
     kernel,
     dtype: np.dtype,
 ) -> bool:
+    # Preallocate CPU reference output.
+    # This avoids allocating a new array inside the CPU timing loop.
     validate_positive_int("iters", iters)
+    validate_input_matrices(a_h, b_h, dtype)
+    check_h = np.empty((a_h.shape[0], b_h.shape[1]), dtype=dtype)
+    validate_matrix_shapes(a_h, b_h, check_h)
+    with nvtx_range("H2D memory copies", id_color=6):
+        a_d = cuda.to_device(a_h)
+        b_d = cuda.to_device(b_h)
+    with nvtx_range("Device output allocation", id_color=6):
+        c_d = cuda.device_array((a_h.shape[0], b_h.shape[1]), dtype=dtype)
+
+    a_d_flat = a_d.ravel()
+    b_d_flat = b_d.ravel()
+    c_d_flat = c_d.ravel()
+    a_num_rows = np.int64(a_d.shape[0])
+    b_num_cols = np.int64(b_d.shape[1])
+    a_num_cols = np.int64(a_d.shape[1])
     validate_matrix_shapes(a_d, b_d, c_d)
     validate_matrix_dtypes(a_d, b_d, c_d, dtype)
-
     # TPB is a compile-time kernel constant, so the launch must use exactly TPB x TPB threads per block.
     validate_block_size(TPB, TPB)
 
@@ -335,21 +388,13 @@ def matmul(
     print(f"tile dimension   = {TPB} x {TPB}")
     print(f"shared memory    = {shared_bytes} bytes/block")
 
-    # Copy inputs once for CPU reference.
-    with nvtx_range("D2H input copies", id_color=2):
-        a_h = a_d.copy_to_host()
-        b_h = b_d.copy_to_host()
-
-    # Preallocate CPU reference output.
-    check_h = np.empty((a_h.shape[0], b_h.shape[1]), dtype=dtype)
-
     # --------------------------------------------------------
     # Warm-up launch
     # --------------------------------------------------------
     print("Warming up CUDA kernel / compiling Numba specialization...")
 
     with nvtx_range("Warmup kernel", id_color=3):
-        kernel[blockspergrid, threadsperblock](np.uint64(a_d.shape[0]), np.uint64(b_d.shape[1]), np.uint64(a_d.shape[1]), a_d.ravel(), b_d.ravel(), c_d.ravel())
+        kernel[blockspergrid, threadsperblock](a_num_rows, b_num_cols, a_num_cols, a_d_flat, b_d_flat, c_d_flat)
 
     cuda.synchronize()
 
@@ -379,9 +424,12 @@ def matmul(
             kernel=kernel,
             blockspergrid=blockspergrid,
             threadsperblock=threadsperblock,
-            a_d=a_d,
-            b_d=b_d,
-            c_d=c_d,
+            a_num_rows=a_num_rows,
+            b_num_cols=b_num_cols,
+            a_num_cols=a_num_cols,
+            a_d_flat=a_d_flat,
+            b_d_flat=b_d_flat,
+            c_d_flat=c_d_flat,
             start_event=start_event,
             stop_event=stop_event,
         )
@@ -593,17 +641,10 @@ def main():
 
     x_h = rng.standard_normal((n, l)).astype(dtype)
     y_h = rng.standard_normal((l, m)).astype(dtype)
-    z_h = np.zeros((n, m), dtype=dtype)
-
-    with nvtx_range("H2D memory copies", id_color=6):
-        x_d = cuda.to_device(x_h)
-        y_d = cuda.to_device(y_h)
-        z_d = cuda.to_device(z_h)
 
     checks_passed = matmul(
-        a_d=x_d,
-        b_d=y_d,
-        c_d=z_d,
+        a_h=x_h,
+        b_h=y_h,
         iters=args.iters,
         kernel=kernel,
         dtype=dtype,
