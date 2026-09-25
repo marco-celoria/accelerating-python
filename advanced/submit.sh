@@ -14,7 +14,8 @@
 
 set -euo pipefail
 mkdir -p logs profiles_${SLURM_JOB_ID}
-
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
+echo "OMP_NUM_THREADS=$OMP_NUM_THREADS"
 # ---------------------------------------------------------------------------
 # Leonardo modules
 # ---------------------------------------------------------------------------
@@ -86,6 +87,7 @@ ${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_advanced_
 ${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_advanced_cupy_numba.job${SLURM_JOB_ID}      python advanced_cupy_numba.py
 ${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_advanced_numba_cupy.job${SLURM_JOB_ID}      python advanced_numba_cupy.py
 ${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_advanced_cupy_torch.job${SLURM_JOB_ID}      python advanced_cupy_torch.py
+${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_advanced_torch_custom.job${SLURM_JOB_ID}    python advanced_torch_custom.py
 ${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_advanced_cupy_cg.job${SLURM_JOB_ID}         python advanced_cupy_cg.py
 ${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_advanced_numba_cg.job${SLURM_JOB_ID}        python advanced_numba_cg.py
 ${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_advanced_cupy_graph.job${SLURM_JOB_ID}      python advanced_cupy_graph.py

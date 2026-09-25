@@ -1,6 +1,6 @@
-# Advanced GPU Programming with CuPy and Numba CUDA
+# Advanced GPU Programming with CuPy, Numba CUDA, and PyTorch
 
-This directory contains advanced CUDA Python examples built with CuPy, Numba CUDA, and PyTorch. The programs cover CUDA streams, asynchronous transfers, pinned host memory, cross-library interoperability, cooperative kernels, CUDA Graph capture and replay, FP64 WMMA tensor-core operations, NVTX annotation, and profiling with NVIDIA Nsight Systems and Nsight Compute.
+This directory contains advanced CUDA Python examples built with CuPy, Numba CUDA, and PyTorch. The programs cover CUDA streams, asynchronous transfers, pinned host memory, cross-library interoperability, PyTorch autograd integration, JIT-compiled PyTorch C++/CUDA extensions, cooperative kernels, CUDA Graph capture and replay, FP64 WMMA tensor-core operations, NVTX annotation, and profiling with NVIDIA Nsight Systems and Nsight Compute.
 
 The examples are listed in the same order in which `submit.sh` executes them.
 
@@ -19,10 +19,25 @@ The examples are listed in the same order in which `submit.sh` executes them.
 |-- advanced_numba_cg.py
 |-- advanced_numba_cupy.py
 |-- advanced_numba_streams.py
+|-- advanced_torch_custom.py
 |-- logs/
 |   |-- run_advanced_<jobid>.err
 |   `-- run_advanced_<jobid>.out
 |-- profiles_<jobid>/
+|   |-- ncu_advanced_cupy_tensorcore.job<jobid>.ncu-rep
+|   |-- nsys_advanced_cupy_asynch.job<jobid>.nsys-rep
+|   |-- nsys_advanced_cupy_cg.job<jobid>.nsys-rep
+|   |-- nsys_advanced_cupy_graph.job<jobid>.nsys-rep
+|   |-- nsys_advanced_cupy_numba.job<jobid>.nsys-rep
+|   |-- nsys_advanced_cupy_streams.job<jobid>.nsys-rep
+|   |-- nsys_advanced_cupy_tensorcore.job<jobid>.nsys-rep
+|   |-- nsys_advanced_cupy_torch.job<jobid>.nsys-rep
+|   |-- nsys_advanced_numba_asynch.job<jobid>.nsys-rep
+|   |-- nsys_advanced_numba_cg.job<jobid>.nsys-rep
+|   |-- nsys_advanced_numba_cupy.job<jobid>.nsys-rep
+|   |-- nsys_advanced_numba_streams.job<jobid>.nsys-rep
+|   `-- nsys_advanced_torch_custom.job<jobid>.nsys-rep
+|-- README.md
 `-- submit.sh
 ```
 
@@ -39,10 +54,11 @@ The examples are run and documented in this order:
 5. `advanced_cupy_numba.py`
 6. `advanced_numba_cupy.py`
 7. `advanced_cupy_torch.py`
-8. `advanced_cupy_cg.py`
-9. `advanced_numba_cg.py`
-10. `advanced_cupy_graph.py`
-11. `advanced_cupy_tensorcore.py`
+8. `advanced_torch_custom.py`
+9. `advanced_cupy_cg.py`
+10. `advanced_numba_cg.py`
+11. `advanced_cupy_graph.py`
+12. `advanced_cupy_tensorcore.py`
 
 The final tensor-core program is executed twice, first under Nsight Systems and then under Nsight Compute.
 
@@ -205,7 +221,7 @@ Numba wraps its native handle without taking ownership:
 numba_stream = cuda.external_stream(cupy_stream.ptr)
 ```
 
-CuPy remains responsible for the stream lifetime. CuPy arrays are allocated and initialized on the shared stream, then passed directly to a Numba CUDA kernel. This works because both libraries expose compatible CUDA device memory interfaces.
+CuPy remains responsible for the stream lifetime. CuPy arrays are allocated and initialized on the shared stream, then passed directly to a Numba CUDA kernel. This works because both libraries expose compatible CUDA device-memory interfaces.
 
 Dependent operations are submitted to the same stream:
 
@@ -269,7 +285,83 @@ cp.from_dlpack(y)
 
 The custom implementation is validated against native PyTorch in both the forward pass and backward gradient calculation using `torch.testing.assert_close`.
 
-### 8. `advanced_cupy_cg.py`
+### 8. `advanced_torch_custom.py`
+
+Builds and executes a native PyTorch C++/CUDA extension with `torch.utils.cpp_extension.load_inline`, then integrates its forward and backward CUDA kernels with PyTorch autograd.
+
+The extension implements the same elementwise function used by `advanced_cupy_torch.py`:
+
+```text
+Forward:
+    y = x^2 + 3x - 2
+
+Backward:
+    grad_x = grad_y * (2x + 3)
+```
+
+The CUDA source contains two one-dimensional kernels:
+
+- `forward_kernel`, which computes the forward transformation;
+- `backward_kernel`, which applies the analytical derivative to the incoming gradient.
+
+The extension is compiled and loaded at runtime with:
+
+```python
+custom_ext = load_inline(
+    name="custom_torch_ext",
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=["custom_forward", "custom_backward"],
+    verbose=False,
+)
+```
+
+The C++ wrappers allocate outputs with `torch::empty_like`, return immediately for empty tensors, and launch 256 threads per block. Both kernels execute in PyTorch's current CUDA stream:
+
+```cpp
+cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+```
+
+Using the current stream preserves ordering between the extension kernels and surrounding native PyTorch operations without an intermediate device synchronization.
+
+The Python `TorchCustomFunction` validates that the forward input is a CUDA FP32 tensor, creates contiguous storage when needed, saves the contiguous input for the backward pass, and makes the incoming gradient contiguous before passing it to the extension:
+
+```python
+class TorchCustomFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        if not x.is_cuda or x.dtype != torch.float32:
+            raise TypeError("Expected a CUDA float32 tensor")
+        x = x.contiguous()
+        ctx.save_for_backward(x)
+        return custom_ext.custom_forward(x)
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        x, = ctx.saved_tensors
+        grad_y = grad_y.contiguous()
+        return custom_ext.custom_backward(x, grad_y)
+```
+
+A small `torch.nn.Module` wrapper exposes the operation through the standard module interface. The program evaluates 1,000 FP32 elements, computes a backward pass with an explicitly generated upstream gradient, and compares both the output and input gradient with a pure PyTorch reference using `torch.testing.assert_close`.
+
+Successful execution prints:
+
+```text
+SUCCESS: Pure PyTorch inline CUDA forward and backward match reference
+```
+
+Before importing PyTorch, the source sets:
+
+```python
+os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0"
+```
+
+This builds the extension for compute capability 8.0, which matches the NVIDIA A100 GPUs used on Leonardo Booster. The value must be changed or generalized when compiling for GPUs with a different compute capability.
+
+The first execution may spend substantially more time compiling and linking the extension than running its small CUDA workload. Later executions can reuse PyTorch's extension cache when the source, extension name, software environment, compiler configuration, and target architecture remain compatible.
+
+### 9. `advanced_cupy_cg.py`
 
 Implements FP64 normalization in a single cooperative CuPy `RawKernel`:
 
@@ -302,7 +394,7 @@ The number of blocks is derived from the occupancy API and the number of streami
 
 The global FP64 accumulator is zeroed before every launch. Results are checked against a CuPy reduction and vectorized normalization reference. The deliberately odd problem size exercises the scalar tail after `double2` vectorization.
 
-### 9. `advanced_numba_cg.py`
+### 10. `advanced_numba_cg.py`
 
 Implements the same single-kernel FP64 normalization with Numba CUDA cooperative groups.
 
@@ -328,7 +420,7 @@ This cap was verified for the software versions stated in the source because lar
 
 CuPy provides the large device arrays, reference implementation, numerical assertions, and NVTX annotations. Numba CUDA provides the cooperative kernel. As in the CuPy implementation, the global accumulator must be initialized to zero before every launch.
 
-### 10. `advanced_cupy_graph.py`
+### 11. `advanced_cupy_graph.py`
 
 Demonstrates CUDA Graph stream capture and repeated replay with CuPy. The captured workload evaluates:
 
@@ -395,7 +487,7 @@ cp.testing.assert_allclose(out, expected, rtol=1.0e-6, atol=1.0e-7)
 
 Host transfers, scalar extraction, dynamic allocation, and other potentially capture-incompatible work are deliberately kept outside the capture region.
 
-### 11. `advanced_cupy_tensorcore.py`
+### 12. `advanced_cupy_tensorcore.py`
 
 Demonstrates an FP64 WMMA matrix multiply-accumulate operation through a CuPy `RawKernel` and CUDA's `mma.h` API.
 
@@ -432,11 +524,15 @@ The examples require:
 - NumPy;
 - CuPy built for the active CUDA version;
 - Numba CUDA;
-- PyTorch with CUDA support for `advanced_cupy_torch.py`;
+- PyTorch with CUDA support for `advanced_cupy_torch.py` and `advanced_torch_custom.py`;
+- a compatible host C++ compiler, CUDA compiler, CUDA toolkit headers, and native build utilities for `advanced_torch_custom.py`;
+- a writable PyTorch extension build/cache directory for the inline C++/CUDA extension;
 - NVIDIA Nsight Systems;
 - NVIDIA Nsight Compute.
 
 The cooperative examples additionally require device support for cooperative kernel launches. The CUDA Graph example requires CUDA stream-capture support in the active CUDA runtime and CuPy build. The FP64 WMMA example requires hardware support for FP64 tensor-core operations.
+
+`advanced_torch_custom.py` sets `TORCH_CUDA_ARCH_LIST=8.0` before importing PyTorch and invoking the extension build. The loaded host compiler, CUDA toolkit, PyTorch build, Python environment, and requested GPU architecture must be mutually compatible.
 
 ## Leonardo environment
 
@@ -460,9 +556,28 @@ ${BASE_DIR}/pygpu_cuda122
 
 It expects the `advanced/` directory and `pygpu_cuda122/` virtual environment to share the same parent directory, since `BASE_DIR` is obtained by temporarily moving to `..`.
 
-The script also selects the GCC 12.2 runtime libraries, discovers the active CUDA installation from `nvcc`, configures a user-built parallel HDF5 installation, enables the CUB CuPy accelerator, establishes a persistent CuPy kernel cache, and configures CUDA-aware UCX transports for Open MPI.
+The script also:
 
-Some loaded modules and environment variables are broader than these single-GPU examples require. They keep the runtime consistent with the larger CUDA, MPI, and HDF5 environment used on Leonardo.
+- selects the GCC 12.2 runtime libraries and preloads `libstdc++` and `libgcc_s`;
+- discovers the active CUDA installation from `nvcc`;
+- exports `CUDA_HOME`, `CUDA_PATH`, and `CUDACXX`;
+- configures a user-built parallel HDF5 installation;
+- enables the CUB CuPy accelerator;
+- establishes a persistent CuPy kernel cache;
+- configures CUDA-aware UCX transports for Open MPI.
+
+The GCC and CUDA settings are also required by `advanced_torch_custom.py`, because `load_inline` invokes PyTorch's native C++/CUDA build pipeline at runtime. The source targets compute capability 8.0, matching the NVIDIA A100 GPUs used on Leonardo Booster.
+
+The submission script does not explicitly set `TORCH_EXTENSIONS_DIR`. PyTorch therefore uses its default extension build/cache location. That location must be writable from the compute node. If a project-local persistent cache is preferred, the script can define one before running the examples:
+
+```bash
+export TORCH_EXTENSIONS_DIR="${BASE_DIR}/.torch_extensions"
+mkdir -p "${TORCH_EXTENSIONS_DIR}"
+```
+
+A persistent cache can avoid rebuilding an unchanged extension in later jobs. Cached extensions may need to be removed after changes to the source, extension name, Python version, PyTorch version, CUDA toolkit, host compiler, compiler flags, or target GPU architecture.
+
+Some loaded modules and environment variables are broader than these single-GPU examples require. They keep the runtime consistent with the larger CUDA, MPI, NCCL, and HDF5 environment used on Leonardo.
 
 ## Running individual examples
 
@@ -476,13 +591,16 @@ python advanced_numba_asynch.py
 python advanced_cupy_numba.py
 python advanced_numba_cupy.py
 python advanced_cupy_torch.py
+python advanced_torch_custom.py
 python advanced_cupy_cg.py
 python advanced_numba_cg.py
 python advanced_cupy_graph.py
 python advanced_cupy_tensorcore.py
 ```
 
-Programs that contain correctness checks print either `Verification passed.` or an equivalent success message after completing successfully.
+Programs that contain correctness checks print `Verification passed.`, `SUCCESS: Pure PyTorch inline CUDA forward and backward match reference`, or an equivalent success message after completing successfully.
+
+The first invocation of `advanced_torch_custom.py` may compile the inline extension before running the CUDA workload. A later compatible invocation may reuse the cached extension.
 
 ## Running the complete suite
 
@@ -518,6 +636,8 @@ sacct -j <jobid> --format=JobID,JobName,State,Elapsed,ExitCode
 
 The script uses `set -euo pipefail`. A failing example stops the suite immediately, so later programs and reports will not be produced after the first error.
 
+The current `submit.sh` executes and profiles `advanced_torch_custom.py` immediately after `advanced_cupy_torch.py`, matching the order documented in this README.
+
 ## Profiling order and generated reports
 
 Standard output and standard error are written to:
@@ -527,7 +647,7 @@ logs/run_advanced_<jobid>.out
 logs/run_advanced_<jobid>.err
 ```
 
-The profiling reports are generated in this exact order:
+The profiling reports are generated in this exact execution order:
 
 ```text
 profiles_<jobid>/nsys_advanced_cupy_streams.job<jobid>.nsys-rep
@@ -537,6 +657,7 @@ profiles_<jobid>/nsys_advanced_numba_asynch.job<jobid>.nsys-rep
 profiles_<jobid>/nsys_advanced_cupy_numba.job<jobid>.nsys-rep
 profiles_<jobid>/nsys_advanced_numba_cupy.job<jobid>.nsys-rep
 profiles_<jobid>/nsys_advanced_cupy_torch.job<jobid>.nsys-rep
+profiles_<jobid>/nsys_advanced_torch_custom.job<jobid>.nsys-rep
 profiles_<jobid>/nsys_advanced_cupy_cg.job<jobid>.nsys-rep
 profiles_<jobid>/nsys_advanced_numba_cg.job<jobid>.nsys-rep
 profiles_<jobid>/nsys_advanced_cupy_graph.job<jobid>.nsys-rep
@@ -592,7 +713,8 @@ ncu-ui profiles_<jobid>/ncu_advanced_cupy_tensorcore.job<jobid>.ncu-rep
 ```
 
 ```bash
-ncu --import profiles_<jobid>/ncu_advanced_cupy_tensorcore.job<jobid>.ncu-rep --page details
+ncu --import profiles_<jobid>/ncu_advanced_cupy_tensorcore.job<jobid>.ncu-rep \
+  --page details
 ```
 
 ## What to inspect in the profilers
@@ -630,15 +752,28 @@ For `advanced_cupy_numba.py` and `advanced_numba_cupy.py`, inspect:
 - synchronization only when host-visible results are required;
 - memory-ownership and stream-ownership differences between the two directions.
 
-### PyTorch interoperability
+### PyTorch interoperability and custom extensions
 
 For `advanced_cupy_torch.py`, inspect:
 
-- PyTorch and CuPy work in the same current CUDA stream;
-- forward and backward raw-kernel launches;
+- PyTorch and CuPy work submitted to the same current CUDA stream;
+- forward and backward CuPy raw-kernel launches;
 - the absence of copies when DLPack views are created;
-- ordering between custom kernels and native PyTorch operations;
+- ordering between custom CuPy kernels and native PyTorch operations;
 - the autograd backward execution sequence.
+
+For `advanced_torch_custom.py`, inspect:
+
+- the native `forward_kernel` and `backward_kernel` CUDA launches;
+- the 256-thread launch configuration and corresponding grid sizes;
+- use of PyTorch's current CUDA stream by both extension kernels;
+- ordering between the extension kernels and native PyTorch reference operations;
+- output allocation performed through `torch::empty_like`;
+- the transition from `TorchCustomFunction.forward` to `TorchCustomFunction.backward`;
+- synchronization associated with final validation or other host-visible results;
+- differences between a first run that builds the extension and a later run that reuses a compatible cache.
+
+Compilation performed by `load_inline` is host-side build activity rather than CUDA kernel execution. Nsight Systems is principally useful for inspecting the CUDA work after the extension has been compiled and loaded. For a cleaner and more representative GPU timeline, build the extension once and reuse the cached build in the profiled execution.
 
 ### Cooperative kernels
 
@@ -701,6 +836,16 @@ Each of the four chunks contains up to 250 million FP64 elements. The three devi
 
 The stream examples use relatively small arrays but perform 10,000 transcendental-function iterations per element. They are compute-intensive by design so that stream scheduling is visible in the profiler.
 
+### PyTorch inline CUDA extension
+
+`advanced_torch_custom.py` uses small tensors and has a modest device-memory footprint. Its first execution can nevertheless require significant wall-clock time because `load_inline` generates build files, invokes the host compiler and `nvcc`, links a Python extension module, and loads the resulting shared library.
+
+The extension cache must be writable. A persistent cache enables reuse across compatible jobs, while a job-specific cache prevents cross-job contention but forces recompilation. Simultaneous jobs that use the same extension name and cache directory can contend for build files or locks.
+
+The current extension uses signed 32-bit `int` values for `numel()` and kernel indexing. The demonstration tensor contains only 1,000 elements, so this is safe. A reusable implementation intended for very large tensors should reject element counts greater than `INT_MAX` or use a suitable 64-bit index type.
+
+The source validates the forward tensor as CUDA FP32 and makes both the saved input and incoming gradient contiguous. A production-oriented extension should additionally validate backward dtype, device, shape, element count, and CUDA launch status inside the extension boundary.
+
 ### Profiling overhead
 
 Nsight Systems and especially the Nsight Compute `full` metric set add overhead. Profiled runtime should not be interpreted as uninstrumented application runtime.
@@ -714,6 +859,11 @@ Nsight Systems and especially the Nsight Compute `full` metric set add overhead.
 - Pinned host memory enables asynchronous DMA transfers but does not guarantee overlap by itself.
 - Overlap also depends on stream choice, dependency structure, copy-engine availability, kernel resource usage, and transfer direction.
 - Device allocations and external stream wrappers must remain valid until all queued work using them has completed.
+- PyTorch C++/CUDA extensions should launch kernels in PyTorch's current CUDA stream rather than assuming the legacy default stream.
+- `advanced_torch_custom.py` makes the input and incoming gradient contiguous before passing their data pointers to kernels that use linear indexing.
+- JIT extension compilation is separate from CUDA kernel execution and can dominate first-run wall-clock time.
+- `TORCH_CUDA_ARCH_LIST` controls the GPU architectures included in the compiled PyTorch extension. The configured architecture must be compatible with the execution GPU.
+- A cached PyTorch extension must remain compatible with the active source, extension name, Python, PyTorch, CUDA, compiler, and target-architecture configuration.
 - Cooperative kernels require every block in the launch to be concurrently resident.
 - CUDA Graph capture requires a capture-compatible operation sequence. Keep output allocation, synchronous host transfers, scalar extraction, and validation outside the capture region.
 - A captured graph continues to reference the original device allocations. Rebinding a Python variable does not update the graph's captured addresses.
@@ -737,9 +887,15 @@ rm -f logs/run_advanced_*.out logs/run_advanced_*.err
 rm -rf profiles_[0-9]*
 ```
 
+If a project-local PyTorch extension cache is configured and must be rebuilt, remove it separately:
+
+```bash
+rm -rf "${BASE_DIR}/.torch_extensions"
+```
+
 Review wildcard expansion carefully before removing files from a shared or important working directory.
 
 ## Scope
 
-These programs are focused demonstrations of advanced CUDA Python mechanisms. They are intended for code study, correctness experiments, Nsight timeline analysis, and comparison of equivalent CuPy and Numba CUDA techniques. They are not complete production benchmarks and do not attempt comprehensive parameter tuning, repeated statistical timing, or portability across every CUDA software stack.
+These programs are focused demonstrations of advanced CUDA Python and PyTorch extension mechanisms. They are intended for code study, correctness experiments, Nsight timeline analysis, and comparison of equivalent or related CuPy, Numba CUDA, and PyTorch techniques. They are not complete production benchmarks and do not attempt comprehensive parameter tuning, repeated statistical timing, exhaustive error handling, or portability across every CUDA software stack.
 
