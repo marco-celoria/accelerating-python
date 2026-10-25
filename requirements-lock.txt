@@ -5,9 +5,9 @@ cuda-pathfinder==1.8.0
 cupy-cuda12x==14.1.1
 cutensor-cu12==2.3.0
 cycler==0.12.1
-filelock==3.32.5
-fonttools==4.64.0
-fsspec==2026.7.0
+filelock==4.0.4
+fonttools==4.66.0
+fsspec==2026.9.0
 h5py==3.16.0
 Jinja2==3.1.6
 kiwisolver==1.5.1
@@ -23,12 +23,12 @@ numba-cuda==0.30.4
 numpy==2.4.6
 packaging==26.3
 pillow==12.3.0
-pyparsing==3.3.2
+pyparsing==3.3.3
 python-dateutil==2.9.0.post0
 PyYAML==6.0.3
 scipy==1.17.0
 six==1.17.0
 sympy==1.13.1
-torch @ file:///leonardo_work/cin_staff/mcelori1/Epicure/ReportGPU/wheels/torch-2.5.1-cp311-cp311-linux_x86_64.whl#sha256=888f32fce5cc5e8c0a9c2e2c1c2e013af502f49ff758fd10663e764d85b427fb
+torch @ file:///leonardo_work/cin_staff/mcelori1/Epicure/epicure-sw/knowledge-base/best-practices/accelerating-python/wheels/torch-2.5.1-cp311-cp311-linux_x86_64.whl#sha256=8e17e66f5583b6fbb8dcfadffd09279b541e595fb286ed63c0396da17bb53694
 triton==3.1.0
 typing_extensions==4.16.0

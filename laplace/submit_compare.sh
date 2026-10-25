@@ -74,7 +74,7 @@ export OMPI_MCA_pml=ucx
 
 source "${VENV_DIR}/bin/activate"
 
-ID_JOB_DIR=56240905
+ID_JOB_DIR=58840246
 
 echo "Numpy vs Cupy + NCCL"
 python compare_h5.py outputs_${ID_JOB_DIR}/out_laplace_numpy_100.h5 outputs_${ID_JOB_DIR}/out_laplace_cupy_nccl_100.h5

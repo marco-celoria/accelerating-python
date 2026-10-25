@@ -9,3 +9,12 @@
 **.ncu-rep
 **.nsys-rep
 **.sqlite
+
+sources/
+wheels/
+pygpu_cuda122/
+logs/
+build-hdf5-1.14.3/
+hdf5-1.14.3-openmpi5/
+.cupy/
+torch_extensions/

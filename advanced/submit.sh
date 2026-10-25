@@ -80,6 +80,39 @@ NSYS_COMMON="nsys profile \
   --cpuctxsw=none \
   --cuda-memory-usage=true"
 
+export TORCH_CUDA_ARCH_LIST="8.0"
+export TORCH_EXTENSIONS_DIR="${BASE_DIR}/torch_extensions"
+mkdir -p ${TORCH_EXTENSIONS_DIR}
+rm -rf "${TORCH_EXTENSIONS_DIR}/custom_torch_ext"
+export MAX_JOBS=1
+
+which python
+which gcc
+which g++
+which nvcc
+which ninja
+
+python --version
+gcc --version
+g++ --version
+nvcc --version
+ninja --version
+
+python - <<'PY'
+import torch
+
+print("torch version       :", torch.__version__)
+print("torch.version.cuda  :", torch.version.cuda)
+print("CUDA available      :", torch.cuda.is_available())
+print("CXX11 ABI           :", torch._C._GLIBCXX_USE_CXX11_ABI)
+
+if torch.cuda.is_available():
+    print("GPU                  :", torch.cuda.get_device_name(0))
+    print("compute capability   :", torch.cuda.get_device_capability(0))
+PY
+
+python advanced_torch_custom.py
+
 ${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_advanced_cupy_streams.job${SLURM_JOB_ID}    python advanced_cupy_streams.py
 ${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_advanced_numba_streams.job${SLURM_JOB_ID}   python advanced_numba_streams.py
 ${NSYS_COMMON} --trace=cuda,nvtx,osrt -o profiles_${SLURM_JOB_ID}/nsys_advanced_cupy_asynch.job${SLURM_JOB_ID}     python advanced_cupy_asynch.py

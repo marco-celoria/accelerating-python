@@ -171,7 +171,7 @@ echo "Comparing CuPy vs CuPy + NCCL"
 python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_cupy_100.h5 outputs_${SLURM_JOB_ID}/out_laplace_cupy_nccl_100_1.h5
 
 echo "Comparing Numba vs Numba + MPI"
-python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_numba_100.h5 outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100_2.h5
+python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_numba_100.h5 outputs_${SLURM_JOB_ID}/out_laplace_numba_mpi_100_4.h5
 
 echo "Comparing 1-GPU vs 4-GPUs: CuPy + NCCL"
 python compare_h5.py outputs_${SLURM_JOB_ID}/out_laplace_cupy_nccl_100_1.h5 outputs_${SLURM_JOB_ID}/out_laplace_cupy_nccl_100_4.h5

@@ -433,18 +433,40 @@ HDF5_DIR="${HDF5_HOME}" \
 # Download PyTorch 2.5.1 source
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Download PyTorch 2.5.1 source
+# ---------------------------------------------------------------------------
+
 if [[ ! -d "${PYTORCH_SOURCE}/.git" ]]; then
     rm -rf "${PYTORCH_SOURCE}"
 
-    git clone \
+    echo "Cloning PyTorch v${PYTORCH_VERSION}"
+
+    git \
+        -c http.version=HTTP/1.1 \
+        clone \
         --branch "v${PYTORCH_VERSION}" \
-        --recursive \
+        --depth 1 \
+        --single-branch \
+        --no-tags \
         https://github.com/pytorch/pytorch.git \
         "${PYTORCH_SOURCE}"
+
+    git -C "${PYTORCH_SOURCE}" submodule sync --recursive
+
+    git \
+        -C "${PYTORCH_SOURCE}" \
+        -c http.version=HTTP/1.1 \
+        submodule update \
+        --init \
+        --recursive \
+        --depth 1 \
+        --jobs "${BUILD_JOBS}"
 else
     git -C "${PYTORCH_SOURCE}" fetch \
-        --tags \
-        origin
+        --depth 1 \
+        origin \
+        "refs/tags/v${PYTORCH_VERSION}:refs/tags/v${PYTORCH_VERSION}"
 
     git -C "${PYTORCH_SOURCE}" checkout \
         --force \
@@ -453,9 +475,13 @@ else
     git -C "${PYTORCH_SOURCE}" submodule sync \
         --recursive
 
-    git -C "${PYTORCH_SOURCE}" submodule update \
+    git \
+        -C "${PYTORCH_SOURCE}" \
+        -c http.version=HTTP/1.1 \
+        submodule update \
         --init \
         --recursive \
+        --depth 1 \
         --jobs "${BUILD_JOBS}"
 fi
 
